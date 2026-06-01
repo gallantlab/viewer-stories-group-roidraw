@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Group-based language comprehension semantic map viewer | Gallant Lab</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #000; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  .gl-bar { flex: 0 0 auto; background: #1a1a1a; border-bottom: 1px solid #333;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.4); font-size: 13px;
+  }
+  .gl-bar .gl-row1 { height: 44px; display: flex; align-items: center; padding: 0 16px; }
+  .gl-bar .gl-row2 {
+    padding: 6px 16px 8px; color: #bbb; font-size: 12px; line-height: 1.3;
+    border-top: 1px solid #2a2a2a;
+  }
+  .gl-bar .gl-row2 a { color: #bbb; text-decoration: underline; text-decoration-color: #555; }
+  .gl-bar .gl-row2 a:hover { color: #fff; text-decoration-color: #fff; }
+  .gl-bar a {
+    color: #fff; text-decoration: none; padding: 6px 10px; border-radius: 4px;
+    transition: background 0.15s; white-space: nowrap;
+  }
+  .gl-bar .gl-row1 a:hover, .gl-bar .gl-row1 a:focus {
+    background: rgba(255,255,255,0.1); outline: none;
+  }
+  .gl-bar .gl-home { font-weight: 700; margin-right: 16px; }
+  .gl-bar nav { display: flex; gap: 2px; flex: 1; }
+  .gl-bar nav a { font-weight: 500; }
+  iframe { flex: 1 1 auto; min-height: 0; width: 100%; border: 0; display: block; }
+</style>
+</head>
+<body>
+  <div class="gl-bar">
+    <div class="gl-row1">
+      <a class="gl-home" href="https://gallantlab.org/" target="_top">Gallant Lab</a>
+      <nav>
+        <a href="https://gallantlab.org/people/" target="_top">People</a>
+        <a href="https://gallantlab.org/publications/" target="_top">Publications</a>
+        <a href="https://gallantlab.org/brain-viewers/" target="_top">Brain Viewers</a>
+        <a href="https://gallantlab.org/learn/" target="_top">Learn</a>
+        <a href="https://gallantlab.org/code/" target="_top">Code</a>
+      </nav>
+    </div>
+  </div>
+
+  <iframe src="viewer.html" title="Group-based language comprehension semantic map viewer"></iframe>
+</body>
+</html>
