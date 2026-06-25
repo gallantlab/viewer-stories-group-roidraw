@@ -1899,6 +1899,7 @@ var ROIDrawBundle = (() => {
       this.adapter = new PycortexAdapter(viewer, opts);
       this.rois = new ROISet();
       this.mode = "display";
+      this._sawFlatInDraw = false;
       this.overlay = new LassoOverlay(this.adapter, {
         onLasso: (pts) => this._finishLasso(pts),
         onInspect: (x, y) => this.adapter.inspectAt(x, y)
@@ -1941,18 +1942,32 @@ var ROIDrawBundle = (() => {
       this.adapter.animateCamera({ target: fr.com, radius: fr.radius });
     }
     _onMix() {
+      if (this.mode === "draw") {
+        if (this.adapter.isFlat()) this._sawFlatInDraw = true;
+        else if (this._sawFlatInDraw) {
+          this.setMode("display");
+          return;
+        }
+      }
       this._updateDrawActive();
       if (this.editOverlay.isEditing()) this.editOverlay.reproject();
       this._frame();
       this._renderStatus();
     }
     // --- modes ------------------------------------------------------------------------
+    // Flatten for Draw/Edit. Resets the "reached flat" latch first so the transient non-flat mix
+    // events the flatten glide emits don't trip the inflate-exits-Draw guard in _onMix before we
+    // actually arrive at flat.
+    _flattenForDraw() {
+      this._sawFlatInDraw = false;
+      this.adapter.flatten();
+    }
     setMode(mode) {
       this.mode = mode;
       if (mode === "draw") {
         this.adapter.setControlPanelVisible(false);
         this.panel.setVisible(true);
-        this.adapter.flatten();
+        this._flattenForDraw();
       } else {
         this._editToggle(null);
         this.panel.setVisible(false);
@@ -2035,6 +2050,7 @@ var ROIDrawBundle = (() => {
     // Toggle shape editing. id => start editing that ROI's bezier; null => stop.
     _editToggle(id) {
       const roi = id != null ? this.rois.rois.find((r) => r.id === id) : null;
+      if (roi && !this.adapter.isFlat()) this._flattenForDraw();
       this.editingId = roi ? roi.id : null;
       this.editOverlay.setEditing(roi || null);
       this.panel.setEditingId(this.editingId);
