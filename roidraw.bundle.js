@@ -46,8 +46,8 @@ var ROIDrawBundle = (() => {
     /* --- projection (host-specific: morph + camera) ----------------------------------- */
     /**
      * Project the surface's vertices to screen px at the CURRENT view, dropping anything
-     * behind the camera. Used for selection and view-framing.
-     * @param {{subsample?:number}} [opts] keep ~1 of every `subsample` vertices (framing only).
+     * behind the camera. Used for lasso selection (the host's own view framing is internal).
+     * @param {{subsample?:number}} [opts] keep ~1 of every `subsample` vertices (a stride; selection passes 1).
      * @returns {{left:{idx:number[], px:[number,number][]}, right:{...}}}  in-frustum verts.
      */
     projectVertices(_opts) {
@@ -138,6 +138,24 @@ var ROIDrawBundle = (() => {
     setControlPanelVisible(_visible) {
     }
   };
+  ViewerAdapter.REQUIRED = [
+    "surfaceId",
+    "isFlat",
+    "viewportSize",
+    "canvas",
+    "projectVertices",
+    "allVertexUV",
+    "vertexUV",
+    "projectVerticesInUvBounds",
+    "setOverlayLayer",
+    "setLayerVisible",
+    "flatten",
+    "setCameraTarget",
+    "setCameraRadius",
+    "cameraRadius",
+    "requestRender",
+    "onMixChange"
+  ];
 
   // core/geom.js
   function pointInPolygon(pt, poly) {
@@ -162,8 +180,8 @@ var ROIDrawBundle = (() => {
     }
     return { minx, miny, maxx, maxy };
   }
-  function inBounds(pt, b) {
-    return pt[0] >= b.minx && pt[0] <= b.maxx && pt[1] >= b.miny && pt[1] <= b.maxy;
+  function inBounds(pt, bounds) {
+    return pt[0] >= bounds.minx && pt[0] <= bounds.maxx && pt[1] >= bounds.miny && pt[1] <= bounds.maxy;
   }
   function simplifyRDP(points, epsilon) {
     if (points.length < 3) return points.slice();
@@ -208,7 +226,7 @@ var ROIDrawBundle = (() => {
     return out;
   }
   function chaikin(points, iterations = 1) {
-    let pts = points;
+    let pts = points.slice();
     for (let it = 0; it < iterations; it++) {
       if (pts.length < 3) break;
       const next = [];
@@ -236,13 +254,18 @@ var ROIDrawBundle = (() => {
   var HEMIS = ["left", "right"];
   var FLAT_THRESHOLD = 0.999;
   var DEFAULT_FILL = 0.7;
-  var FRAME_SUBSAMPLE = 250;
+  var FRAME_TARGET_SAMPLES = 250;
   var ZOOM_SENSITIVITY = 1e-3;
   var DEFAULT_FOV_DEG = 35;
   var OVERLAY_RETRY_MAX = 40;
   var OVERLAY_RETRY_MS = 250;
   var COLLAPSE_SCHEDULE_MS = [400, 1200, 2500, 4500];
   var COLLAPSE_WINDOW_MS = 8e3;
+  var DEFAULT_THICKMIX = 0.5;
+  var FALLBACK_TEX_W = 1024;
+  var FALLBACK_TEX_H = 768;
+  var OUTLINE_STROKE_PX = 3;
+  var LABEL_FONT_PT = 14;
   function attrCount(attr) {
     if (attr.count !== void 0 && !isNaN(attr.count)) return attr.count;
     return attr.array.length / attr.itemSize;
@@ -267,9 +290,16 @@ var ROIDrawBundle = (() => {
     if (!surface) missing.push("Surface (viewer.surfs[].surf with .pivots)");
     else {
       if (!surface.pivots) missing.push("surface.pivots (morph transform chain)");
-      const h = surface.hemis;
-      if (!h || !h.left || !h.left.attributes || !h.left.attributes.position)
-        missing.push("surface.hemis.left.attributes.position (vertex geometry)");
+      const h = surface.hemis || {};
+      for (const side of ["left", "right"]) {
+        const hemi = h[side];
+        if (!hemi || !hemi.attributes) {
+          missing.push(`surface.hemis.${side} (hemisphere geometry)`);
+          continue;
+        }
+        if (!hemi.attributes.position) missing.push(`surface.hemis.${side}.attributes.position (vertex geometry)`);
+        if (!hemi.attributes.uv) missing.push(`surface.hemis.${side}.attributes.uv (flat-UV coords)`);
+      }
     }
     if (!svgoverlay) missing.push("svgoverlay (global, ROI overlay rendering)");
     return { ok: missing.length === 0, missing };
@@ -292,7 +322,7 @@ var ROIDrawBundle = (() => {
       this._layerName = layerName;
       this._animSpeedFallback = animSpeedFallback;
       this._v = new this.THREE.Vector3();
-      this._thickmix = 0.5;
+      this._thickmix = DEFAULT_THICKMIX;
       this._drawn = null;
       this._layerHidden = false;
       this._labelsHidden = false;
@@ -304,6 +334,7 @@ var ROIDrawBundle = (() => {
         const d = this.viewer.active && this.viewer.active.data && this.viewer.active.data[0];
         if (d && d.subject) return d.subject;
       } catch (e) {
+        console.debug("[roidraw] surfaceId lookup failed, using 'unknown':", e);
       }
       return "unknown";
     }
@@ -329,6 +360,10 @@ var ROIDrawBundle = (() => {
           if (typeof m === "number") return m;
         }
       } catch (e) {
+        if (!this._mixWarned) {
+          this._mixWarned = true;
+          console.warn("[roidraw] reading surfmix failed; treating as not-flat:", e);
+        }
       }
       return 0;
     }
@@ -432,7 +467,8 @@ var ROIDrawBundle = (() => {
     // --- view framing primitive -------------------------------------------------------
     // Center of mass (world) + the camera radius that fills `fillTarget` of the viewport.
     // fill is the on-screen NDC extent (canvas-size independent); on-screen size ∝ 1/radius.
-    measureFrame(fillTarget = DEFAULT_FILL, subsample = FRAME_SUBSAMPLE) {
+    // (host-only — used by the controller's framing; not part of the portable ViewerAdapter contract.)
+    measureFrame(fillTarget = DEFAULT_FILL, targetSamples = FRAME_TARGET_SAMPLES) {
       const ctrl = this.viewer.controls;
       if (!ctrl || typeof ctrl.radius !== "number") return null;
       const { cam, surfmix, foy, W, H } = this._prepProjection();
@@ -442,7 +478,7 @@ var ROIDrawBundle = (() => {
         const pivot = this.surface.pivots[h].back;
         pivot.updateMatrixWorld(true);
         const mw = pivot.matrixWorld, pd = this.posdata[h], n = attrCount(pd.positions[0]);
-        const step = Math.max(1, Math.floor(n / subsample));
+        const step = Math.max(1, Math.floor(n / targetSamples));
         for (let i = 0; i < n; i += step) {
           const w = this._worldOf(pd, mw, i, surfmix, foy);
           sx += w.x;
@@ -530,6 +566,7 @@ var ROIDrawBundle = (() => {
       this.requestRender();
     }
     // Smooth state transition using the viewer's own animation (same as its toolbar buttons).
+    // (host-only — used by the controller's framing/flatten; not part of the portable contract.)
     animateCamera({ target, radius, mix }) {
       const sp = this._animSpeed(), anim = [];
       if (target) anim.push({ state: "camera.target", idx: sp, value: [target[0], target[1], target[2]] });
@@ -539,6 +576,7 @@ var ROIDrawBundle = (() => {
       try {
         this.viewer.animate(anim);
       } catch (e) {
+        console.warn("[roidraw] viewer.animate failed; snapping instead:", e);
         if (target) this.setCameraTarget(target);
         if (radius != null) this.setCameraRadius(radius);
         if (mix != null && typeof this.viewer.setMix === "function") this.viewer.setMix(mix);
@@ -601,14 +639,14 @@ var ROIDrawBundle = (() => {
         if (d) {
           const path = doc.createElementNS(SVGNS, "path");
           path.setAttribute("d", d);
-          path.setAttribute("style", "fill:none;stroke:#ffffff;stroke-width:3;stroke-opacity:1");
+          path.setAttribute("style", "fill:none;stroke:#ffffff;stroke-width:" + OUTLINE_STROKE_PX + ";stroke-opacity:1");
           shapesEl.appendChild(path);
         }
         const ptidx = this._labelPtidx(roi.labelVert);
         if (ptidx != null) {
           const t = doc.createElementNS(SVGNS, "text");
           t.setAttribute("data-ptidx", String(ptidx));
-          t.setAttribute("style", "font-family:Helvetica, sans-serif;font-size:14pt;font-weight:bold;font-style:italic;fill:white;fill-opacity:1;text-anchor:middle;filter:url(#dropshadow)");
+          t.setAttribute("style", "font-family:Helvetica, sans-serif;font-size:" + LABEL_FONT_PT + "pt;font-weight:bold;font-style:italic;fill:white;fill-opacity:1;text-anchor:middle;filter:url(#dropshadow)");
           t.appendChild(doc.createTextNode(roi.name));
           labelsEl.appendChild(t);
         }
@@ -618,8 +656,8 @@ var ROIDrawBundle = (() => {
       try {
         labels = new this.svgoverlay.Labels(labelsEl, svgo.posdata, !!this._labelsHidden);
         labels.shader.uniforms.depth.value = svgo.depth;
-        const w = this.surface.width || this.viewportSize().width || 1024;
-        const h = this.surface.height || this.viewportSize().height || 768;
+        const w = this.surface.width || this.viewportSize().width || FALLBACK_TEX_W;
+        const h = this.surface.height || this.viewportSize().height || FALLBACK_TEX_H;
         labels.shader.uniforms.scale.value.set(1 / w, 1 / h);
         labels.setMix({ mix: this._currentMix(), thickmix: this._thickmix });
         svgo.labels.left.add(labels.meshes.left);
@@ -828,49 +866,50 @@ var ROIDrawBundle = (() => {
         }))
       };
     }
-    /* Append ROIs from a parsed document. Returns the ROIs added. Throws on an unknown format. */
+    /* Append ROIs from a parsed document. Returns the ROIs added. Throws on an unknown format.
+     * Purely structural: arrays are defensively copied so the model never aliases the caller's
+     * parsed JSON, and a missing labelVert is left null (the viewer back-fills it from geometry —
+     * see draw-pipeline.backfillLabel — so reloaded ROIs label the same way freshly drawn ones do). */
     loadJSON(doc) {
-      if (!doc || !doc.format || doc.format.indexOf("pycortex-roidraw") !== 0)
+      if (!doc || !doc.format || !String(doc.format).startsWith("pycortex-roidraw"))
         throw new Error("unrecognized format: " + (doc && doc.format));
       const added = [];
       for (const r of doc.rois || []) {
         const v = r.vertices || {};
-        const roi = this.add({
+        added.push(this.add({
           name: r.name || "roi" + this.nextId,
           color: r.color,
-          left: v.left || [],
-          right: v.right || [],
-          outline: r.outline || null,
+          left: (v.left || []).slice(),
+          right: (v.right || []).slice(),
+          outline: r.outline ? r.outline.slice() : null,
           labelVert: r.labelVert || null,
           bezier: r.bezier || null
-        });
-        if (!roi.labelVert && roi.outline && roi.outline.length)
-          roi.labelVert = roi.outline[Math.floor(roi.outline.length / 2)];
-        added.push(roi);
+        }));
       }
       return added;
     }
   };
 
   // core/draw-mode.js
+  var MODE = { DISPLAY: "display", DRAW: "draw" };
   var DrawModeMachine = class {
     constructor() {
-      this.mode = "display";
+      this.mode = MODE.DISPLAY;
       this.sawFlat = false;
     }
     enterDraw() {
-      this.mode = "draw";
+      this.mode = MODE.DRAW;
       this.sawFlat = false;
       return { flatten: true };
     }
     enterDisplay() {
-      this.mode = "display";
+      this.mode = MODE.DISPLAY;
       return {};
     }
     // A surface morph frame. In Draw: reaching flat arms the latch; a non-flat frame once the
     // latch is armed means the user inflated, so the caller should drop back to Display.
     noteMix(isFlat) {
-      if (this.mode === "draw") {
+      if (this.mode === MODE.DRAW) {
         if (isFlat) this.sawFlat = true;
         else if (this.sawFlat) return { exit: true };
       }
@@ -886,7 +925,7 @@ var ROIDrawBundle = (() => {
       return { flatten: false };
     }
     lassoActive(isFlat, editing) {
-      return this.mode === "draw" && isFlat && !editing;
+      return this.mode === MODE.DRAW && isFlat && !editing;
     }
   };
 
@@ -912,8 +951,8 @@ var ROIDrawBundle = (() => {
   }
 
   // core/outline.js
-  var DEFAULT_EPSILON = 4;
-  function buildOutline(lasso, sel, { epsilon = DEFAULT_EPSILON } = {}) {
+  var PIXEL_RDP_EPSILON = 4;
+  function buildOutline(lasso, sel, { epsilon = PIXEL_RDP_EPSILON } = {}) {
     let simp = simplifyRDP(lasso, epsilon);
     if (simp.length < 3) simp = lasso;
     const cand = [];
@@ -967,7 +1006,7 @@ var ROIDrawBundle = (() => {
   }
 
   // core/bezier.js
-  var DEFAULT_EPSILON2 = 4e-3;
+  var UV_RDP_EPSILON = 4e-3;
   function catmullRomHandles(anchors) {
     const n = anchors.length;
     const inHandles = new Array(n), outHandles = new Array(n);
@@ -997,7 +1036,7 @@ var ROIDrawBundle = (() => {
     }
     return bi === 0 ? pts : pts.slice(bi).concat(pts.slice(0, bi));
   }
-  function fitClosedBezier(ring, { epsilon = DEFAULT_EPSILON2 } = {}) {
+  function fitClosedBezier(ring, { epsilon = UV_RDP_EPSILON } = {}) {
     if (!ring || ring.length < 3) return null;
     let pts = ring.slice();
     const f = pts[0], l = pts[pts.length - 1];
@@ -1019,14 +1058,17 @@ var ROIDrawBundle = (() => {
       a * p0[1] + b * c1[1] + c * c2[1] + d * p3[1]
     ];
   }
+  function segControls(anchors, inHandles, outHandles, i) {
+    const j = (i + 1) % anchors.length;
+    return [anchors[i], outHandles[i], inHandles[j], anchors[j]];
+  }
   function evalClosedBezier(bez, samplesPerSeg = 12) {
     if (!bez || !bez.anchors || bez.anchors.length < 3) return [];
     const { anchors, inHandles, outHandles } = bez;
     const n = anchors.length, out = [];
     const steps = Math.max(1, samplesPerSeg | 0);
     for (let i = 0; i < n; i++) {
-      const j = (i + 1) % n;
-      const p0 = anchors[i], c1 = outHandles[i], c2 = inHandles[j], p3 = anchors[j];
+      const [p0, c1, c2, p3] = segControls(anchors, inHandles, outHandles, i);
       for (let s = 0; s < steps; s++) out.push(cubicAt(p0, c1, c2, p3, s / steps));
     }
     return out;
@@ -1042,7 +1084,9 @@ var ROIDrawBundle = (() => {
       anchors: bez.anchors.map((p) => [p[0], p[1]]),
       inHandles: bez.inHandles.map((p) => [p[0], p[1]]),
       outHandles: bez.outHandles.map((p) => [p[0], p[1]]),
-      smooth: bez.smooth ? bez.smooth.slice(0, n) : bez.anchors.map(() => true)
+      // one smooth flag per anchor: truncate an over-long array, pad a too-short one with `true`
+      // (a missing flag must default to smooth, not leak `undefined` which reads as a corner).
+      smooth: Array.from({ length: n }, (_, i) => bez.smooth && i < bez.smooth.length ? bez.smooth[i] : true)
     };
   }
   function moveAnchor(bez, i, pos) {
@@ -1116,8 +1160,7 @@ var ROIDrawBundle = (() => {
     const n = anchors.length, steps = Math.max(2, samplesPerSeg | 0);
     let best = null;
     for (let i = 0; i < n; i++) {
-      const j = (i + 1) % n;
-      const p0 = anchors[i], c1 = outHandles[i], c2 = inHandles[j], p3 = anchors[j];
+      const [p0, c1, c2, p3] = segControls(anchors, inHandles, outHandles, i);
       for (let s = 0; s <= steps; s++) {
         const t = s / steps, q = cubicAt(p0, c1, c2, p3, t);
         const dx = q[0] - pt[0], dy = q[1] - pt[1], d = dx * dx + dy * dy;
@@ -1142,6 +1185,18 @@ var ROIDrawBundle = (() => {
   function backfillBezier(adapter, ring) {
     const ringUv = ringToUv(adapter, ring);
     return ringUv && ringUv.length >= 3 ? fitClosedBezier(ringUv) : null;
+  }
+  function backfillLabel(adapter, ring) {
+    if (!ring) return null;
+    const sel = { left: [], right: [], px: { left: [], right: [] } };
+    for (const o of ring) {
+      const uv = adapter.vertexUV(o);
+      if (uv) {
+        sel[o.h].push(o.g);
+        sel.px[o.h].push(uv);
+      }
+    }
+    return pickLabelVertex(sel);
   }
   function roiFromBezier(adapter, bezier) {
     const poly = evalClosedBezier(bezier, BEZIER_SAMPLES);
@@ -1172,6 +1227,8 @@ var ROIDrawBundle = (() => {
 
   // ui/lasso-overlay.js
   var DRAG_THRESHOLD = 4;
+  var LASSO_STROKE = "#ffcc00";
+  var LASSO_WIDTH = 1.5;
   var LassoOverlay = class {
     constructor(adapter, { onLasso, onInspect } = {}) {
       this.adapter = adapter;
@@ -1311,8 +1368,8 @@ var ROIDrawBundle = (() => {
       if (!ctx) return;
       ctx.clearRect(0, 0, this.el.width, this.el.height);
       if (this.lasso.length > 1) {
-        ctx.strokeStyle = "#ffcc00";
-        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = LASSO_STROKE;
+        ctx.lineWidth = LASSO_WIDTH;
         ctx.beginPath();
         ctx.moveTo(this.lasso[0][0], this.lasso[0][1]);
         for (let j = 1; j < this.lasso.length; j++) ctx.lineTo(this.lasso[j][0], this.lasso[j][1]);
@@ -1326,13 +1383,16 @@ var ROIDrawBundle = (() => {
   };
 
   // core/transform.js
+  var PIVOT_EPS = 1e-12;
+  var W_EPS = 1e-12;
+  var DET_EPS = 1e-12;
   function solve(A, b) {
     const n = b.length;
     const M = A.map((row, i) => row.concat(b[i]));
     for (let col = 0; col < n; col++) {
       let piv = col;
       for (let r = col + 1; r < n; r++) if (Math.abs(M[r][col]) > Math.abs(M[piv][col])) piv = r;
-      if (Math.abs(M[piv][col]) < 1e-12) return null;
+      if (Math.abs(M[piv][col]) < PIVOT_EPS) return null;
       const tmp = M[col];
       M[col] = M[piv];
       M[piv] = tmp;
@@ -1411,14 +1471,14 @@ var ROIDrawBundle = (() => {
   function applyHomography(H, pt) {
     const x = pt[0], y = pt[1];
     let w = H[6] * x + H[7] * y + H[8];
-    if (!isFinite(w) || Math.abs(w) < 1e-12) w = w < 0 ? -1e-12 : 1e-12;
+    if (!isFinite(w) || Math.abs(w) < W_EPS) w = w < 0 ? -W_EPS : W_EPS;
     return [(H[0] * x + H[1] * y + H[2]) / w, (H[3] * x + H[4] * y + H[5]) / w];
   }
   function invertHomography(H) {
     const a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7], i = H[8];
     const A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g;
     const det = a * A + b * B + c * C;
-    if (Math.abs(det) < 1e-12) return null;
+    if (Math.abs(det) < DET_EPS) return null;
     const id = 1 / det;
     return [
       A * id,
@@ -1433,14 +1493,54 @@ var ROIDrawBundle = (() => {
     ];
   }
 
+  // ui/overlay-geom.js
+  function nearestWithin(points, pt, radius) {
+    let best = -1, bd = radius * radius;
+    for (let i = 0; i < points.length; i++) {
+      const dx = points[i][0] - pt[0], dy = points[i][1] - pt[1], d = dx * dx + dy * dy;
+      if (d <= bd) {
+        bd = d;
+        best = i;
+      }
+    }
+    return best;
+  }
+  function hitTest(anchorPx, handlePx, sel, pt, { hitRadius, handleRadius }) {
+    if (sel >= 0 && handlePx) {
+      for (const which of ["out", "in"]) {
+        const hp = handlePx[which];
+        if (hp) {
+          const dx = hp[0] - pt[0], dy = hp[1] - pt[1];
+          if (dx * dx + dy * dy <= handleRadius * handleRadius) return { kind: "handle", i: sel, which };
+        }
+      }
+    }
+    const i = nearestWithin(anchorPx, pt, hitRadius);
+    return i >= 0 ? { kind: "anchor", i } : null;
+  }
+
   // ui/bezier-edit-overlay.js
   var HIT_RADIUS = 9;
   var HANDLE_RADIUS = 8;
   var CURVE_HIT = 7;
+  var CURVE_HIT_SAMPLES = 24;
   var DRAG_SLOP = 1.5;
   var TRACK_MS = 500;
   var LOCAL_MARGIN = 0.06;
   var CURVE_SAMPLES = 40;
+  var ANCHOR_R = 4;
+  var ANCHOR_R_BIG = 6;
+  var HANDLE_DOT_R = 4;
+  var COLOR = {
+    // editor palette
+    curve: "#39d0ff",
+    handleLine: "#9fe8ff",
+    handleFill: "#fff",
+    handleStroke: "#1f7fa0",
+    anchorStroke: "#0a3a4a",
+    anchorSel: "#fff"
+  };
+  var now = () => typeof performance !== "undefined" ? performance.now() : Date.now();
   var BezierEditOverlay = class {
     constructor(adapter, { onEdit } = {}) {
       this.adapter = adapter;
@@ -1526,15 +1626,14 @@ var ROIDrawBundle = (() => {
     // keeps gliding for several). Instead, re-track on rAF for a short window after the gesture, so
     // the knots follow the surface every frame until the camera settles.
     _pokeTracking() {
-      this._trackUntil = (typeof performance !== "undefined" ? performance.now() : Date.now()) + TRACK_MS;
+      this._trackUntil = now() + TRACK_MS;
       if (!this._raf) this._raf = requestAnimationFrame(() => this._trackFrame());
     }
     _trackFrame() {
       this._raf = 0;
       if (!this.roi) return;
       this.reproject();
-      const now = typeof performance !== "undefined" ? performance.now() : Date.now();
-      if (now < this._trackUntil) this._raf = requestAnimationFrame(() => this._trackFrame());
+      if (now() < this._trackUntil) this._raf = requestAnimationFrame(() => this._trackFrame());
     }
     _stopTracking() {
       if (this._raf) {
@@ -1594,35 +1693,17 @@ var ROIDrawBundle = (() => {
       const r = this.el.getBoundingClientRect();
       return [e.clientX - r.left, e.clientY - r.top];
     }
-    // Hit-test a point against the editable bits, nearest first: the selected anchor's two handles
-    // (they sit on top), then any anchor. Returns { kind:"handle"|"anchor", i, which? } or null.
+    // Hit-test a point against the editable bits (pure math in overlay-geom.js): the selected
+    // anchor's two handles (on top), then any anchor. Returns { kind, i, which? } or null.
     _hitTest(pt) {
-      if (this._sel >= 0 && this._handlePx) {
-        for (const which of ["out", "in"]) {
-          const hp = this._handlePx[which];
-          if (hp) {
-            const dx = hp[0] - pt[0], dy = hp[1] - pt[1];
-            if (dx * dx + dy * dy <= HANDLE_RADIUS * HANDLE_RADIUS) return { kind: "handle", i: this._sel, which };
-          }
-        }
-      }
-      let best = -1, bd = HIT_RADIUS * HIT_RADIUS;
-      for (let i = 0; i < this._anchorPx.length; i++) {
-        const a = this._anchorPx[i];
-        const dx = a[0] - pt[0], dy = a[1] - pt[1], d = dx * dx + dy * dy;
-        if (d <= bd) {
-          bd = d;
-          best = i;
-        }
-      }
-      return best >= 0 ? { kind: "anchor", i: best } : null;
+      return hitTest(this._anchorPx, this._handlePx, this._sel, pt, { hitRadius: HIT_RADIUS, handleRadius: HANDLE_RADIUS });
     }
     // Is `pt` (px) close to the curve? Map it to uv, find the nearest curve point, map that back to
     // px and compare in px. Returns { seg, t } for a split, or null.
     _hitCurve(pt) {
       if (!this.Hinv || !this.H) return null;
       const uv = applyHomography(this.Hinv, pt);
-      const hit = nearestOnClosedBezier(this.bez, uv, 24);
+      const hit = nearestOnClosedBezier(this.bez, uv, CURVE_HIT_SAMPLES);
       if (!hit) return null;
       const px = applyHomography(this.H, hit.point);
       const dx = px[0] - pt[0], dy = px[1] - pt[1];
@@ -1718,16 +1799,7 @@ var ROIDrawBundle = (() => {
       }
     }
     _hitTestAnchorOnly(pt) {
-      let best = -1, bd = HIT_RADIUS * HIT_RADIUS;
-      for (let i = 0; i < this._anchorPx.length; i++) {
-        const a = this._anchorPx[i];
-        const dx = a[0] - pt[0], dy = a[1] - pt[1], d = dx * dx + dy * dy;
-        if (d <= bd) {
-          bd = d;
-          best = i;
-        }
-      }
-      return best;
+      return nearestWithin(this._anchorPx, pt, HIT_RADIUS);
     }
     _onKeyDown(e) {
       if (!this.roi || this._sel < 0) return;
@@ -1766,7 +1838,7 @@ var ROIDrawBundle = (() => {
       if (!this.roi || !this.H || !this._uvPoly) return;
       const toPx = (uv) => applyHomography(this.H, uv);
       const poly = this._uvPoly.map(toPx);
-      ctx.strokeStyle = "#39d0ff";
+      ctx.strokeStyle = COLOR.curve;
       ctx.lineWidth = 1.5;
       ctx.beginPath();
       ctx.moveTo(poly[0][0], poly[0][1]);
@@ -1780,7 +1852,7 @@ var ROIDrawBundle = (() => {
         const out = toPx(this.bez.outHandles[this._sel]);
         const inp = toPx(this.bez.inHandles[this._sel]);
         this._handlePx = { out, in: inp };
-        ctx.strokeStyle = "#9fe8ff";
+        ctx.strokeStyle = COLOR.handleLine;
         ctx.lineWidth = 1;
         for (const hp of [out, inp]) {
           ctx.beginPath();
@@ -1788,24 +1860,24 @@ var ROIDrawBundle = (() => {
           ctx.lineTo(hp[0], hp[1]);
           ctx.stroke();
           ctx.beginPath();
-          ctx.arc(hp[0], hp[1], 4, 0, Math.PI * 2);
-          ctx.fillStyle = "#fff";
+          ctx.arc(hp[0], hp[1], HANDLE_DOT_R, 0, Math.PI * 2);
+          ctx.fillStyle = COLOR.handleFill;
           ctx.fill();
           ctx.lineWidth = 1.5;
-          ctx.strokeStyle = "#1f7fa0";
+          ctx.strokeStyle = COLOR.handleStroke;
           ctx.stroke();
-          ctx.strokeStyle = "#9fe8ff";
+          ctx.strokeStyle = COLOR.handleLine;
           ctx.lineWidth = 1;
         }
       }
       ctx.lineWidth = 2;
-      ctx.strokeStyle = "#0a3a4a";
+      ctx.strokeStyle = COLOR.anchorStroke;
       const hoverI = this._hover && this._hover.kind === "anchor" ? this._hover.i : -1;
       for (let i = 0; i < this._anchorPx.length; i++) {
         const a = this._anchorPx[i];
         const big = i === this._sel || i === hoverI;
-        const r = big ? 6 : 4;
-        ctx.fillStyle = i === this._sel ? "#fff" : "#39d0ff";
+        const r = big ? ANCHOR_R_BIG : ANCHOR_R;
+        ctx.fillStyle = i === this._sel ? COLOR.anchorSel : COLOR.curve;
         ctx.beginPath();
         if (this.bez.smooth[i]) ctx.arc(a[0], a[1], r, 0, Math.PI * 2);
         else ctx.rect(a[0] - r, a[1] - r, r * 2, r * 2);
@@ -1838,6 +1910,7 @@ var ROIDrawBundle = (() => {
       this.statusEl.className = "roidraw-status";
       el.appendChild(this.statusEl);
       this.doneEl = document.createElement("button");
+      this.doneEl.type = "button";
       this.doneEl.className = "roidraw-done";
       this.doneEl.textContent = "\u2713 Done editing";
       this.doneEl.style.display = "none";
@@ -1847,6 +1920,7 @@ var ROIDrawBundle = (() => {
       this.listEl.className = "roidraw-list";
       el.appendChild(this.listEl);
       const exp = document.createElement("button");
+      exp.type = "button";
       exp.textContent = "Export JSON";
       exp.onclick = () => onExport && onExport();
       el.appendChild(exp);
@@ -1864,6 +1938,7 @@ var ROIDrawBundle = (() => {
       lab.appendChild(inp);
       el.appendChild(lab);
       const clr = document.createElement("button");
+      clr.type = "button";
       clr.textContent = "Clear all";
       clr.onclick = () => onClear && onClear();
       el.appendChild(clr);
@@ -1887,6 +1962,11 @@ var ROIDrawBundle = (() => {
     }
     setVisible(on) {
       this.el.style.display = on ? "" : "none";
+    }
+    // Remove the panel from the DOM (matches the overlays' destroy(); called by ROIDrawer teardown).
+    destroy() {
+      if (this.el && this.el.parentNode) this.el.parentNode.removeChild(this.el);
+      this.el = null;
     }
     renderList(rois) {
       const ed = rois.find((r) => r.id === this._editingId);
@@ -1918,6 +1998,7 @@ var ROIDrawBundle = (() => {
         ct.textContent = String(r.left.length + r.right.length);
         row.appendChild(ct);
         const edit = document.createElement("button");
+        edit.type = "button";
         edit.className = "roidraw-roi__editbtn" + (editing ? " roidraw-roi__editbtn--on" : "");
         edit.textContent = editing ? "editing" : "\u270E edit";
         edit.title = r.bezier ? editing ? "finish editing" : "edit shape" : "no editable curve";
@@ -1927,10 +2008,12 @@ var ROIDrawBundle = (() => {
           if (r.bezier) this.onEdit(editing ? null : r.id);
         };
         row.appendChild(edit);
-        const del = document.createElement("a");
+        const del = document.createElement("button");
+        del.type = "button";
         del.className = "roidraw-roi__del";
         del.textContent = "\u2715";
         del.title = "remove";
+        del.setAttribute("aria-label", "remove " + r.name);
         del.onclick = (e) => {
           e.preventDefault();
           this.onRemove(r.id);
@@ -1955,10 +2038,16 @@ var ROIDrawBundle = (() => {
     }
     _mkBtn(label, mode, onMode) {
       const b = document.createElement("button");
+      b.type = "button";
       b.className = "roidraw-modebtn";
       b.textContent = label;
       b.onclick = () => onMode && onMode(mode);
       return b;
+    }
+    // Remove the toggle bar from the DOM (matches the overlays' destroy(); called by ROIDrawer teardown).
+    destroy() {
+      if (this.el && this.el.parentNode) this.el.parentNode.removeChild(this.el);
+      this.el = null;
     }
     setMode(mode) {
       this.displayBtn.classList.toggle("roidraw-modebtn--active", mode === "display");
@@ -1974,7 +2063,7 @@ var ROIDrawBundle = (() => {
   };
 
   // ui/roidraw.css
-  var roidraw_default = '/* roidraw UI \u2014 class-based styles (no inline style strings in the JS). */\n\n.roidraw-overlay {\n    position: fixed;\n    left: 0;\n    top: 0;\n    pointer-events: none;          /* only captures in draw mode (.roidraw-overlay--active) */\n    z-index: 9998;\n    outline-offset: -2px;\n}\n.roidraw-overlay--active { cursor: crosshair; background: rgba(255, 204, 0, 0.05); outline: 2px dashed rgba(255, 204, 0, 0.8); }\n.roidraw-overlay--inspect { cursor: cell;  background: rgba(80, 160, 255, 0.06); outline: 2px dashed rgba(80, 160, 255, 0.85); }\n.roidraw-edit-overlay--active { outline: 2px dashed rgba(57, 208, 255, 0.85); }\n\n.roidraw-panel {\n    position: fixed;\n    right: 10px;\n    top: 8px;\n    z-index: 9999;\n    width: 230px;\n    padding: 10px;\n    background: rgba(20, 20, 20, 0.92);\n    color: #eee;\n    font: 12px/1.4 -apple-system, system-ui, sans-serif;\n    border: 1px solid #444;\n    border-radius: 6px;\n}\n.roidraw-panel h2 { font-size: 12px; font-weight: 700; margin: 0 0 6px; }\n.roidraw-panel button { width: 100%; margin-bottom: 6px; }\n.roidraw-panel input[type="file"] { width: 100%; }\n.roidraw-panel label { display: block; margin-bottom: 4px; }\n\n.roidraw-status { margin-bottom: 6px; }\n.roidraw-status--ok    { color: #9f9; }\n.roidraw-status--warn  { color: #f99; }\n.roidraw-status--draw  { color: #ffcc00; }\n.roidraw-status--inspect { color: #6cf; }\n\n.roidraw-list { margin-bottom: 6px; }\n.roidraw-list__empty { color: #777; }\n.roidraw-roi { display: flex; align-items: center; gap: 4px; margin: 2px 0; }\n.roidraw-roi__swatch { width: 10px; height: 10px; display: inline-block; border-radius: 2px; }\n.roidraw-roi__name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }\n.roidraw-roi__count { color: #999; }\n.roidraw-roi__editbtn {\n    width: auto;                   /* override .roidraw-panel button { width: 100% } */\n    margin: 0;\n    padding: 3px 9px;\n    font-size: 11px;\n    color: #cdeffb;\n    background: #18586e;\n    border: 1px solid #2c7d99;\n    border-radius: 4px;\n    cursor: pointer;\n}\n.roidraw-roi__editbtn:hover:not(:disabled) { background: #1e6f8a; }\n.roidraw-roi__editbtn--on { background: #1e9fd0; border-color: #4cc6f0; color: #04222e; font-weight: 700; }\n.roidraw-roi__editbtn:disabled { opacity: 0.4; cursor: default; }\n.roidraw-roi__del { color: #f77; text-decoration: none; cursor: pointer; }\n.roidraw-roi--editing { outline: 1px solid rgba(57, 208, 255, 0.6); border-radius: 3px; }\n\n.roidraw-done {\n    background: #1e9fd0;\n    color: #04222e;\n    font-weight: 700;\n    border: 0;\n    padding: 9px;\n    border-radius: 5px;\n}\n.roidraw-done:hover { background: #36b6e6; }\n\n.roidraw-msg { color: #9cf; font-size: 11px; max-height: 110px; overflow: auto; word-break: break-word; }\n\n.roidraw-modebar {\n    position: fixed;\n    right: 264px;                  /* refined to sit left of the control panel at runtime */\n    top: 8px;\n    z-index: 10001;\n    display: flex;\n    border-radius: 6px;\n    overflow: hidden;\n    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);\n    font: 600 12px -apple-system, system-ui, sans-serif;\n}\n.roidraw-modebtn { border: 0; padding: 7px 16px; cursor: pointer; color: #eee; background: #333; }\n.roidraw-modebtn--active { background: #1a7f37; }\n';
+  var roidraw_default = '/* roidraw UI \u2014 class-based styles (no inline style strings in the JS). */\n\n.roidraw-overlay {\n    position: fixed;\n    left: 0;\n    top: 0;\n    pointer-events: none;          /* only captures in draw mode (.roidraw-overlay--active) */\n    z-index: 9998;\n    outline-offset: -2px;\n}\n.roidraw-overlay--active { cursor: crosshair; background: rgba(255, 204, 0, 0.05); outline: 2px dashed rgba(255, 204, 0, 0.8); }\n.roidraw-overlay--inspect { cursor: cell;  background: rgba(80, 160, 255, 0.06); outline: 2px dashed rgba(80, 160, 255, 0.85); }\n.roidraw-edit-overlay--active { outline: 2px dashed rgba(57, 208, 255, 0.85); }\n\n.roidraw-panel {\n    position: fixed;\n    right: 10px;\n    top: 8px;\n    z-index: 9999;\n    width: 230px;\n    padding: 10px;\n    background: rgba(20, 20, 20, 0.92);\n    color: #eee;\n    font: 12px/1.4 -apple-system, system-ui, sans-serif;\n    border: 1px solid #444;\n    border-radius: 6px;\n}\n.roidraw-panel h2 { font-size: 12px; font-weight: 700; margin: 0 0 6px; }\n.roidraw-panel button { width: 100%; margin-bottom: 6px; }\n.roidraw-panel input[type="file"] { width: 100%; }\n.roidraw-panel label { display: block; margin-bottom: 4px; }\n\n.roidraw-status { margin-bottom: 6px; }\n.roidraw-status--ok    { color: #9f9; }\n.roidraw-status--warn  { color: #f99; }\n.roidraw-status--draw  { color: #ffcc00; }\n.roidraw-status--inspect { color: #6cf; }\n\n.roidraw-list { margin-bottom: 6px; }\n.roidraw-list__empty { color: #777; }\n.roidraw-roi { display: flex; align-items: center; gap: 4px; margin: 2px 0; }\n.roidraw-roi__swatch { width: 10px; height: 10px; display: inline-block; border-radius: 2px; }\n.roidraw-roi__name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }\n.roidraw-roi__count { color: #999; }\n.roidraw-roi__editbtn {\n    width: auto;                   /* override .roidraw-panel button { width: 100% } */\n    margin: 0;\n    padding: 3px 9px;\n    font-size: 11px;\n    color: #cdeffb;\n    background: #18586e;\n    border: 1px solid #2c7d99;\n    border-radius: 4px;\n    cursor: pointer;\n}\n.roidraw-roi__editbtn:hover:not(:disabled) { background: #1e6f8a; }\n.roidraw-roi__editbtn--on { background: #1e9fd0; border-color: #4cc6f0; color: #04222e; font-weight: 700; }\n.roidraw-roi__editbtn:disabled { opacity: 0.4; cursor: default; }\n/* a bare \u2715 glyph: strip the default <button> chrome (background/border/padding) so only the \xD7 shows */\n.roidraw-roi__del { color: #f77; background: none; border: none; padding: 0; font: inherit; line-height: 1; cursor: pointer; }\n.roidraw-roi__del:hover { color: #ff9a9a; }\n.roidraw-roi--editing { outline: 1px solid rgba(57, 208, 255, 0.6); border-radius: 3px; }\n\n.roidraw-done {\n    background: #1e9fd0;\n    color: #04222e;\n    font-weight: 700;\n    border: 0;\n    padding: 9px;\n    border-radius: 5px;\n}\n.roidraw-done:hover { background: #36b6e6; }\n\n.roidraw-msg { color: #9cf; font-size: 11px; max-height: 110px; overflow: auto; word-break: break-word; }\n\n.roidraw-modebar {\n    position: fixed;\n    right: 264px;                  /* refined to sit left of the control panel at runtime */\n    top: 8px;\n    z-index: 10001;\n    display: flex;\n    border-radius: 6px;\n    overflow: hidden;\n    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);\n    font: 600 12px -apple-system, system-ui, sans-serif;\n}\n.roidraw-modebtn { border: 0; padding: 7px 16px; cursor: pointer; color: #eee; background: #333; }\n.roidraw-modebtn--active { background: #1a7f37; }\n';
 
   // index.js
   var LAYER = "drawnrois";
@@ -2086,8 +2175,10 @@ var ROIDrawBundle = (() => {
         this.panel.message("0 vertices selected \u2014 lasso the flatmap.");
         return;
       }
-      const name = window.prompt("ROI name:", "roi" + (this.rois.length + 1));
-      if (name === null) return;
+      const fallback = "roi" + (this.rois.length + 1);
+      const entered = window.prompt("ROI name:", fallback);
+      if (entered === null) return;
+      const name = entered.trim() || fallback;
       this.rois.add({
         name,
         left: sel.left,
@@ -2179,6 +2270,10 @@ var ROIDrawBundle = (() => {
           const added = this.rois.loadJSON(JSON.parse(text));
           let fitted = 0;
           for (const roi of added) {
+            if (!roi.labelVert && roi.outline) {
+              const lv = backfillLabel(this.adapter, roi.outline);
+              if (lv) roi.labelVert = lv;
+            }
             if (roi.bezier || !roi.outline) continue;
             const bez = backfillBezier(this.adapter, roi.outline);
             if (bez) {
@@ -2192,6 +2287,7 @@ var ROIDrawBundle = (() => {
           this.panel.message("Import failed: " + (err && err.message ? err.message : err));
         }
       };
+      reader.onerror = () => this.panel.message("Import failed: could not read \u201C" + file.name + "\u201D.");
       reader.readAsText(file);
     }
     // --- ui positioning + keyboard ----------------------------------------------------
@@ -2209,9 +2305,20 @@ var ROIDrawBundle = (() => {
       this._keyup = (e) => {
         if (e.key === "Shift") this.overlay.setPassthrough(false);
       };
+      this._blur = () => this.overlay.setPassthrough(false);
       window.addEventListener("keydown", this._keydown, true);
       window.addEventListener("keyup", this._keyup, true);
-      window.addEventListener("blur", () => this.overlay.setPassthrough(false));
+      window.addEventListener("blur", this._blur);
+    }
+    // Tear down everything attach() wired up: the mix subscription, the window listeners, and every
+    // child UI component (each has its own destroy()). Lets a viewer detach/re-attach without leaking.
+    destroy() {
+      if (this._unsubMix) this._unsubMix();
+      window.removeEventListener("resize", this._onResize);
+      window.removeEventListener("keydown", this._keydown, true);
+      window.removeEventListener("keyup", this._keyup, true);
+      window.removeEventListener("blur", this._blur);
+      for (const c of [this.overlay, this.editOverlay, this.panel, this.toggle]) if (c && c.destroy) c.destroy();
     }
     // True only for text-entry targets (so we don't swallow Shift/Esc there). A file/button input
     // is NOT text entry, so global gestures keep working even if such an element holds focus.
@@ -2233,6 +2340,7 @@ var ROIDrawBundle = (() => {
       const v = window.viewer;
       if (v && surfaceReady(v)) {
         try {
+          if (window.roidrawer && window.roidrawer.destroy) window.roidrawer.destroy();
           window.roidrawer = attach(v, opts);
         } catch (e) {
           console.error("[roidraw] attach failed:", e);
