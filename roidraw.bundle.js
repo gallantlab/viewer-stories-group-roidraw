@@ -258,6 +258,22 @@ var ROIDrawBundle = (() => {
     }
     return null;
   }
+  function preflightHost({ THREE, mriview, svgoverlay, viewer } = {}) {
+    const missing = [];
+    if (!THREE) missing.push("THREE (global three.js)");
+    if (!mriview) missing.push("mriview (global)");
+    else if (typeof mriview.get_position !== "function") missing.push("mriview.get_position() (vertex morph)");
+    const surface = findSurface(viewer);
+    if (!surface) missing.push("Surface (viewer.surfs[].surf with .pivots)");
+    else {
+      if (!surface.pivots) missing.push("surface.pivots (morph transform chain)");
+      const h = surface.hemis;
+      if (!h || !h.left || !h.left.attributes || !h.left.attributes.position)
+        missing.push("surface.hemis.left.attributes.position (vertex geometry)");
+    }
+    if (!svgoverlay) missing.push("svgoverlay (global, ROI overlay rendering)");
+    return { ok: missing.length === 0, missing };
+  }
   function surfaceReady(viewer) {
     const s = findSurface(viewer);
     return !!(s && s.pivots && s.hemis && s.hemis.left && s.hemis.left.attributes && s.hemis.left.attributes.position);
@@ -268,11 +284,10 @@ var ROIDrawBundle = (() => {
       this.THREE = globalThis.THREE;
       this.mriview = globalThis.mriview;
       this.svgoverlay = globalThis.svgoverlay;
-      if (!this.THREE) throw new Error("[roidraw] THREE global not found");
-      if (!this.mriview || !this.mriview.get_position) throw new Error("[roidraw] mriview.get_position not found");
       this.viewer = viewer;
+      const pf = preflightHost({ THREE: this.THREE, mriview: this.mriview, svgoverlay: this.svgoverlay, viewer });
+      if (!pf.ok) throw new Error("[roidraw] incompatible pycortex viewer \u2014 missing: " + pf.missing.join("; "));
       this.surface = findSurface(viewer);
-      if (!this.surface) throw new Error("[roidraw] could not locate Surface (viewer.surfs[].surf)");
       this.posdata = this.surface.picker && this.surface.picker.posdata || this._buildPosdata();
       this._layerName = layerName;
       this._animSpeedFallback = animSpeedFallback;
@@ -837,6 +852,44 @@ var ROIDrawBundle = (() => {
     }
   };
 
+  // core/draw-mode.js
+  var DrawModeMachine = class {
+    constructor() {
+      this.mode = "display";
+      this.sawFlat = false;
+    }
+    enterDraw() {
+      this.mode = "draw";
+      this.sawFlat = false;
+      return { flatten: true };
+    }
+    enterDisplay() {
+      this.mode = "display";
+      return {};
+    }
+    // A surface morph frame. In Draw: reaching flat arms the latch; a non-flat frame once the
+    // latch is armed means the user inflated, so the caller should drop back to Display.
+    noteMix(isFlat) {
+      if (this.mode === "draw") {
+        if (isFlat) this.sawFlat = true;
+        else if (this.sawFlat) return { exit: true };
+      }
+      return { exit: false };
+    }
+    // Starting an edit happens on the flatmap; if the surface is inflated we re-flatten first
+    // (which re-arms the latch so that flatten's own glide doesn't trip noteMix's exit).
+    noteEditStart(isFlat) {
+      if (!isFlat) {
+        this.sawFlat = false;
+        return { flatten: true };
+      }
+      return { flatten: false };
+    }
+    lassoActive(isFlat, editing) {
+      return this.mode === "draw" && isFlat && !editing;
+    }
+  };
+
   // core/selection.js
   function selectInPolygon(projected, lasso) {
     const bounds = polygonBounds(lasso);
@@ -1072,6 +1125,49 @@ var ROIDrawBundle = (() => {
       }
     }
     return best ? { seg: best.seg, t: best.t, point: best.point, dist: Math.sqrt(best.d2) } : null;
+  }
+
+  // draw-pipeline.js
+  var BEZIER_SAMPLES = 16;
+  var OUTLINE_EPS_UV = 3e-3;
+  function ringToUv(adapter, ring) {
+    if (!ring) return null;
+    const uv = [];
+    for (const o of ring) {
+      const p = adapter.vertexUV(o);
+      if (p) uv.push(p);
+    }
+    return uv;
+  }
+  function backfillBezier(adapter, ring) {
+    const ringUv = ringToUv(adapter, ring);
+    return ringUv && ringUv.length >= 3 ? fitClosedBezier(ringUv) : null;
+  }
+  function roiFromBezier(adapter, bezier) {
+    const poly = evalClosedBezier(bezier, BEZIER_SAMPLES);
+    if (poly.length < 3) return null;
+    const all = adapter.allVertexUV();
+    const projectedUv = { left: { idx: all.left.idx, px: all.left.uv }, right: { idx: all.right.idx, px: all.right.uv } };
+    const sel = selectInPolygon(projectedUv, poly);
+    const outline = buildOutline(poly, sel, { epsilon: OUTLINE_EPS_UV });
+    return { left: sel.left, right: sel.right, outline, labelVert: pickLabelVertex(sel), total: sel.total };
+  }
+  function deriveRoiFromLasso(adapter, pts) {
+    const projected = adapter.projectVertices({ subsample: 1 });
+    const sel0 = selectInPolygon(projected, pts);
+    if (!sel0.total) return { left: [], right: [], outline: null, labelVert: null, bezier: null, total: 0 };
+    const lassoRing = buildOutline(pts, sel0);
+    const ringUv = ringToUv(adapter, lassoRing);
+    const bezier = ringUv && ringUv.length >= 3 ? fitClosedBezier(ringUv) : null;
+    const derived = bezier ? roiFromBezier(adapter, bezier) : null;
+    const sel = derived && derived.total ? derived : {
+      left: sel0.left,
+      right: sel0.right,
+      outline: lassoRing,
+      labelVert: pickLabelVertex(sel0),
+      total: sel0.total
+    };
+    return { left: sel.left, right: sel.right, outline: sel.outline, labelVert: sel.labelVert, bezier, total: sel.total };
   }
 
   // ui/lasso-overlay.js
@@ -1884,8 +1980,6 @@ var ROIDrawBundle = (() => {
   var LAYER = "drawnrois";
   var FILL_TARGET = 0.7;
   var FRAME_LERP = 0.3;
-  var BEZIER_SAMPLES = 16;
-  var OUTLINE_EPS_UV = 3e-3;
   function injectCss() {
     if (document.getElementById("roidraw-css")) return;
     const s = document.createElement("style");
@@ -1898,8 +1992,7 @@ var ROIDrawBundle = (() => {
       injectCss();
       this.adapter = new PycortexAdapter(viewer, opts);
       this.rois = new ROISet();
-      this.mode = "display";
-      this._sawFlatInDraw = false;
+      this._dm = new DrawModeMachine();
       this.overlay = new LassoOverlay(this.adapter, {
         onLasso: (pts) => this._finishLasso(pts),
         onInspect: (x, y) => this.adapter.inspectAt(x, y)
@@ -1925,6 +2018,10 @@ var ROIDrawBundle = (() => {
       this.setMode("display");
       this._frameOnLoad(0);
     }
+    // The mode ("display"|"draw") is owned by the state machine; read through to it.
+    get mode() {
+      return this._dm.mode;
+    }
     // --- view framing -----------------------------------------------------------------
     _frame() {
       const fr = this.adapter.measureFrame(FILL_TARGET);
@@ -1942,12 +2039,9 @@ var ROIDrawBundle = (() => {
       this.adapter.animateCamera({ target: fr.com, radius: fr.radius });
     }
     _onMix() {
-      if (this.mode === "draw") {
-        if (this.adapter.isFlat()) this._sawFlatInDraw = true;
-        else if (this._sawFlatInDraw) {
-          this.setMode("display");
-          return;
-        }
+      if (this._dm.noteMix(this.adapter.isFlat()).exit) {
+        this.setMode("display");
+        return;
       }
       this._updateDrawActive();
       if (this.editOverlay.isEditing()) this.editOverlay.reproject();
@@ -1955,20 +2049,13 @@ var ROIDrawBundle = (() => {
       this._renderStatus();
     }
     // --- modes ------------------------------------------------------------------------
-    // Flatten for Draw/Edit. Resets the "reached flat" latch first so the transient non-flat mix
-    // events the flatten glide emits don't trip the inflate-exits-Draw guard in _onMix before we
-    // actually arrive at flat.
-    _flattenForDraw() {
-      this._sawFlatInDraw = false;
-      this.adapter.flatten();
-    }
     setMode(mode) {
-      this.mode = mode;
       if (mode === "draw") {
+        if (this._dm.enterDraw().flatten) this.adapter.flatten();
         this.adapter.setControlPanelVisible(false);
         this.panel.setVisible(true);
-        this._flattenForDraw();
       } else {
+        this._dm.enterDisplay();
         this._editToggle(null);
         this.panel.setVisible(false);
         this.adapter.setControlPanelVisible(true);
@@ -1981,7 +2068,7 @@ var ROIDrawBundle = (() => {
     // Lasso capture is on exactly when we're in Draw mode AND flat AND not editing a shape. Drawing
     // is flat-only; Draw mode flattens automatically, so capture switches on when the morph finishes.
     _updateDrawActive() {
-      this.overlay.setActive(this.mode === "draw" && this.adapter.isFlat() && !this.editOverlay.isEditing());
+      this.overlay.setActive(this._dm.lassoActive(this.adapter.isFlat(), this.editOverlay.isEditing()));
     }
     _renderStatus() {
       if (this.mode !== "draw") return;
@@ -1994,23 +2081,11 @@ var ROIDrawBundle = (() => {
     }
     // --- drawing pipeline -------------------------------------------------------------
     _finishLasso(pts) {
-      const projected = this.adapter.projectVertices({ subsample: 1 });
-      const sel0 = selectInPolygon(projected, pts);
-      if (!sel0.total) {
+      const sel = deriveRoiFromLasso(this.adapter, pts);
+      if (!sel.total) {
         this.panel.message("0 vertices selected \u2014 lasso the flatmap.");
         return;
       }
-      const lassoRing = buildOutline(pts, sel0);
-      const ringUv = this._ringToUv(lassoRing);
-      const bezier = ringUv && ringUv.length >= 3 ? fitClosedBezier(ringUv) : null;
-      const derived = bezier ? this._roiFromBezier(bezier) : null;
-      const sel = derived && derived.total ? derived : {
-        left: sel0.left,
-        right: sel0.right,
-        outline: lassoRing,
-        labelVert: pickLabelVertex(sel0),
-        total: sel0.total
-      };
       const name = window.prompt("ROI name:", "roi" + (this.rois.length + 1));
       if (name === null) return;
       this.rois.add({
@@ -2019,38 +2094,16 @@ var ROIDrawBundle = (() => {
         right: sel.right,
         outline: sel.outline,
         labelVert: sel.labelVert,
-        bezier
+        bezier: sel.bezier
       });
       this._sync();
-      this.panel.message('ROI "' + name + '": ' + sel.total + " vertices." + (bezier ? " \u270E editable." : ""));
-    }
-    // Map an outline ring [{h,g}] to flat-UV points [[u,v],...], dropping vertices with no uv.
-    _ringToUv(ring) {
-      if (!ring) return null;
-      const uv = [];
-      for (const o of ring) {
-        const p = this.adapter.vertexUV(o);
-        if (p) uv.push(p);
-      }
-      return uv;
-    }
-    // Derive ROI membership + outline + label from a bezier, entirely in flat-UV (view-independent,
-    // so a reloaded ROI selects the same vertices). selectInPolygon/buildOutline are coordinate-space
-    // agnostic, so we feed them uv where they'd normally get screen px.
-    _roiFromBezier(bezier) {
-      const poly = evalClosedBezier(bezier, BEZIER_SAMPLES);
-      if (poly.length < 3) return null;
-      const all = this.adapter.allVertexUV();
-      const projectedUv = { left: { idx: all.left.idx, px: all.left.uv }, right: { idx: all.right.idx, px: all.right.uv } };
-      const sel = selectInPolygon(projectedUv, poly);
-      const outline = buildOutline(poly, sel, { epsilon: OUTLINE_EPS_UV });
-      return { left: sel.left, right: sel.right, outline, labelVert: pickLabelVertex(sel), total: sel.total };
+      this.panel.message('ROI "' + name + '": ' + sel.total + " vertices." + (sel.bezier ? " \u270E editable." : ""));
     }
     // --- editing ----------------------------------------------------------------------
     // Toggle shape editing. id => start editing that ROI's bezier; null => stop.
     _editToggle(id) {
       const roi = id != null ? this.rois.rois.find((r) => r.id === id) : null;
-      if (roi && !this.adapter.isFlat()) this._flattenForDraw();
+      if (roi && this._dm.noteEditStart(this.adapter.isFlat()).flatten) this.adapter.flatten();
       this.editingId = roi ? roi.id : null;
       this.editOverlay.setEditing(roi || null);
       this.panel.setEditingId(this.editingId);
@@ -2063,7 +2116,7 @@ var ROIDrawBundle = (() => {
       const roi = this.rois.rois.find((r) => r.id === this.editingId);
       if (!roi) return;
       roi.bezier = bezier;
-      const d = this._roiFromBezier(bezier);
+      const d = roiFromBezier(this.adapter, bezier);
       if (d && d.total) {
         roi.left = d.left;
         roi.right = d.right;
@@ -2127,8 +2180,7 @@ var ROIDrawBundle = (() => {
           let fitted = 0;
           for (const roi of added) {
             if (roi.bezier || !roi.outline) continue;
-            const ringUv = this._ringToUv(roi.outline);
-            const bez = ringUv && ringUv.length >= 3 ? fitClosedBezier(ringUv) : null;
+            const bez = backfillBezier(this.adapter, roi.outline);
             if (bez) {
               roi.bezier = bez;
               fitted++;
