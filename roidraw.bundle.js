@@ -78,11 +78,11 @@ var ROIDrawBundle = (() => {
     /* --- overlay layer (the occlusion-correct ROI rendering) -------------------------- */
     /**
      * Create/replace a named overlay layer rendered INTO the surface (so it occludes and morphs
-     * like built-in ROIs). `rois` carries, per ROI, the boundary ring + label vertex (and, when
-     * present, an editable flat-UV `bezier` the adapter renders as a smooth cubic path); the
-     * adapter converts vertices/bezier→uv→layer geometry.
+     * like built-in ROIs). `rois` carries, per ROI, the boundary ring + label vertex + display
+     * color (and, when present, an editable flat-UV `bezier` the adapter renders as a smooth cubic
+     * path); the adapter converts vertices/bezier→uv→layer geometry and strokes it in the ROI color.
      * @param {string} name
-     * @param {Array<{name, outline:[{h,g}], labelVert:{h,g}, bezier?}>} rois
+     * @param {Array<{name, color?, outline:[{h,g}], labelVert:{h,g}, bezier?}>} rois
      */
     setOverlayLayer(_name, _rois) {
       throw new Error("ViewerAdapter.setOverlayLayer not implemented");
@@ -265,7 +265,12 @@ var ROIDrawBundle = (() => {
   var FALLBACK_TEX_W = 1024;
   var FALLBACK_TEX_H = 768;
   var OUTLINE_STROKE_PX = 3;
+  var OUTLINE_HALO_PX = 2;
+  var OUTLINE_FALLBACK_COLOR = "#ffffff";
   var LABEL_FONT_PT = 14;
+  function safeColor(c) {
+    return typeof c === "string" && /^#[0-9a-fA-F]{3,8}$/.test(c) ? c : OUTLINE_FALLBACK_COLOR;
+  }
   function attrCount(attr) {
     if (attr.count !== void 0 && !isNaN(attr.count)) return attr.count;
     return attr.array.length / attr.itemSize;
@@ -382,10 +387,13 @@ var ROIDrawBundle = (() => {
     }
     // World position of geometry-local vertex `i` at the current mix (incl. the flatoff offset
     // so it lands on the *rendered* mesh, not floating above it). Mutates+returns this._v.
+    // Applies the flatoff offset to our OWN vector (never to get_position's returned `pos`, which
+    // may be a shared/cached vector inside mriview — mutating it would corrupt host state).
     _worldOf(pd, mw, i, surfmix, foy) {
       const gp = this.mriview.get_position(pd, surfmix, this._thickmix, i).pos;
-      gp.y -= foy;
-      return this._v.copy(gp).applyMatrix4(mw);
+      this._v.copy(gp);
+      this._v.y -= foy;
+      return this._v.applyMatrix4(mw);
     }
     projectVertices({ subsample = 1 } = {}) {
       const { cam, surfmix, foy, W, H } = this._prepProjection();
@@ -637,9 +645,13 @@ var ROIDrawBundle = (() => {
       for (const roi of rois) {
         const d = this._roiSvgPath(roi, W, H);
         if (d) {
+          const halo = doc.createElementNS(SVGNS, "path");
+          halo.setAttribute("d", d);
+          halo.setAttribute("style", "fill:none;stroke:#ffffff;stroke-width:" + (OUTLINE_STROKE_PX + OUTLINE_HALO_PX) + ";stroke-opacity:0.9");
+          shapesEl.appendChild(halo);
           const path = doc.createElementNS(SVGNS, "path");
           path.setAttribute("d", d);
-          path.setAttribute("style", "fill:none;stroke:#ffffff;stroke-width:" + OUTLINE_STROKE_PX + ";stroke-opacity:1");
+          path.setAttribute("style", "fill:none;stroke:" + safeColor(roi.color) + ";stroke-width:" + OUTLINE_STROKE_PX + ";stroke-opacity:1");
           shapesEl.appendChild(path);
         }
         const ptidx = this._labelPtidx(roi.labelVert);
@@ -1213,16 +1225,18 @@ var ROIDrawBundle = (() => {
     if (!sel0.total) return { left: [], right: [], outline: null, labelVert: null, bezier: null, total: 0 };
     const lassoRing = buildOutline(pts, sel0);
     const ringUv = ringToUv(adapter, lassoRing);
-    const bezier = ringUv && ringUv.length >= 3 ? fitClosedBezier(ringUv) : null;
-    const derived = bezier ? roiFromBezier(adapter, bezier) : null;
-    const sel = derived && derived.total ? derived : {
+    const fitted = ringUv && ringUv.length >= 3 ? fitClosedBezier(ringUv) : null;
+    const derived = fitted ? roiFromBezier(adapter, fitted) : null;
+    if (derived && derived.total)
+      return { left: derived.left, right: derived.right, outline: derived.outline, labelVert: derived.labelVert, bezier: fitted, total: derived.total };
+    return {
       left: sel0.left,
       right: sel0.right,
       outline: lassoRing,
       labelVert: pickLabelVertex(sel0),
+      bezier: null,
       total: sel0.total
     };
-    return { left: sel.left, right: sel.right, outline: sel.outline, labelVert: sel.labelVert, bezier, total: sel.total };
   }
 
   // ui/lasso-overlay.js
@@ -2134,7 +2148,7 @@ var ROIDrawBundle = (() => {
       }
       this._updateDrawActive();
       if (this.editOverlay.isEditing()) this.editOverlay.reproject();
-      this._frame();
+      if (this.mode === "draw") this._frame();
       this._renderStatus();
     }
     // --- modes ------------------------------------------------------------------------
