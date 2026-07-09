@@ -78,13 +78,14 @@ var ROIDrawBundle = (() => {
     /* --- overlay layer (the occlusion-correct ROI rendering) -------------------------- */
     /**
      * Create/replace a named overlay layer rendered INTO the surface (so it occludes and morphs
-     * like built-in ROIs). `rois` carries, per ROI, the boundary ring + label vertex + display
-     * color (and, when present, an editable flat-UV `bezier` the adapter renders as a smooth cubic
-     * path); the adapter converts vertices/bezier→uv→layer geometry and strokes it in the ROI color.
+     * like built-in ROIs). `shapes` carries, per shape, its `kind` ("roi" | "sulcus"), a label
+     * vertex, a display color, and an editable flat-UV `bezier` the adapter renders as a cubic
+     * path — closed for an ROI, open (no `Z`) for a sulcus. ROIs may also carry a boundary ring
+     * (`outline`) used as a fallback for files predating the bezier.
      * @param {string} name
-     * @param {Array<{name, color?, outline:[{h,g}], labelVert:{h,g}, bezier?}>} rois
+     * @param {Array<{kind, name, color?, outline?:[{h,g}], labelVert:{h,g}, bezier?}>} shapes
      */
-    setOverlayLayer(_name, _rois) {
+    setOverlayLayer(_name, _shapes) {
       throw new Error("ViewerAdapter.setOverlayLayer not implemented");
     }
     /** Show/hide the outlines and labels of a previously-created layer. */
@@ -249,6 +250,295 @@ var ROIDrawBundle = (() => {
     return [sx / points.length, sy / points.length];
   }
 
+  // core/bezier.js
+  var UV_RDP_EPSILON = 4e-3;
+  function isClosed(bez) {
+    return !bez || bez.closed !== false;
+  }
+  function segCount(bez) {
+    const n = bez && bez.anchors ? bez.anchors.length : 0;
+    return isClosed(bez) ? n : Math.max(0, n - 1);
+  }
+  function catmullRomHandles(anchors, closed = true) {
+    const n = anchors.length;
+    const inHandles = new Array(n), outHandles = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const a = anchors[i];
+      if (!closed && n >= 2 && i === 0) {
+        const b = anchors[1];
+        outHandles[0] = [a[0] + (b[0] - a[0]) / 3, a[1] + (b[1] - a[1]) / 3];
+        inHandles[0] = [a[0], a[1]];
+        continue;
+      }
+      if (!closed && n >= 2 && i === n - 1) {
+        const b = anchors[n - 2];
+        inHandles[i] = [a[0] + (b[0] - a[0]) / 3, a[1] + (b[1] - a[1]) / 3];
+        outHandles[i] = [a[0], a[1]];
+        continue;
+      }
+      const prev = anchors[(i - 1 + n) % n], next = anchors[(i + 1) % n];
+      const tx = (next[0] - prev[0]) / 6, ty = (next[1] - prev[1]) / 6;
+      outHandles[i] = [a[0] + tx, a[1] + ty];
+      inHandles[i] = [a[0] - tx, a[1] - ty];
+    }
+    return { inHandles, outHandles };
+  }
+  function bezierFromAnchors(anchors, closed = true) {
+    const a = anchors.map((p) => [p[0], p[1]]);
+    const { inHandles, outHandles } = catmullRomHandles(a, closed);
+    const smooth = a.map((_, i) => closed || i !== 0 && i !== a.length - 1);
+    return { closed, anchors: a, inHandles, outHandles, smooth };
+  }
+  function rotateToExtreme(pts) {
+    const c = centroid(pts);
+    if (!c) return pts;
+    let bi = 0, bd = -1;
+    for (let i = 0; i < pts.length; i++) {
+      const dx = pts[i][0] - c[0], dy = pts[i][1] - c[1], d = dx * dx + dy * dy;
+      if (d > bd) {
+        bd = d;
+        bi = i;
+      }
+    }
+    return bi === 0 ? pts : pts.slice(bi).concat(pts.slice(0, bi));
+  }
+  function fitClosedBezier(ring, { epsilon = UV_RDP_EPSILON } = {}) {
+    if (!ring || ring.length < 3) return null;
+    let pts = ring.slice();
+    const f = pts[0], l = pts[pts.length - 1];
+    if (pts.length > 3 && f[0] === l[0] && f[1] === l[1]) pts.pop();
+    pts = rotateToExtreme(pts);
+    let anchors = simplifyRDP(pts, epsilon);
+    if (anchors.length < 3) anchors = pts;
+    if (anchors.length > 3) {
+      const a0 = anchors[0], aN = anchors[anchors.length - 1];
+      if (a0[0] === aN[0] && a0[1] === aN[1]) anchors.pop();
+    }
+    if (anchors.length < 3) return null;
+    return bezierFromAnchors(anchors);
+  }
+  function dedupe(pts) {
+    const out = [];
+    for (const p of pts) {
+      const q = out[out.length - 1];
+      if (!q || q[0] !== p[0] || q[1] !== p[1]) out.push([p[0], p[1]]);
+    }
+    return out;
+  }
+  function fitOpenBezier(polyline, { epsilon = UV_RDP_EPSILON } = {}) {
+    if (!polyline || polyline.length < 2) return null;
+    const pts = dedupe(polyline);
+    if (pts.length < 2) return null;
+    let anchors = simplifyRDP(pts, epsilon);
+    if (anchors.length < 2) anchors = pts;
+    return bezierFromAnchors(anchors, false);
+  }
+  function cubicAt(p0, c1, c2, p3, t) {
+    const mt = 1 - t, a = mt * mt * mt, b = 3 * mt * mt * t, c = 3 * mt * t * t, d = t * t * t;
+    return [
+      a * p0[0] + b * c1[0] + c * c2[0] + d * p3[0],
+      a * p0[1] + b * c1[1] + c * c2[1] + d * p3[1]
+    ];
+  }
+  function segControls(anchors, inHandles, outHandles, i, closed = true) {
+    const j = closed ? (i + 1) % anchors.length : i + 1;
+    return [anchors[i], outHandles[i], inHandles[j], anchors[j]];
+  }
+  function evalClosedBezier(bez, samplesPerSeg = 12) {
+    if (!bez || !bez.anchors || bez.anchors.length < 3) return [];
+    const { anchors, inHandles, outHandles } = bez;
+    const n = anchors.length, out = [];
+    const steps = Math.max(1, samplesPerSeg | 0);
+    for (let i = 0; i < n; i++) {
+      const [p0, c1, c2, p3] = segControls(anchors, inHandles, outHandles, i, true);
+      for (let s = 0; s < steps; s++) out.push(cubicAt(p0, c1, c2, p3, s / steps));
+    }
+    return out;
+  }
+  function evalOpenBezier(bez, samplesPerSeg = 12) {
+    if (!bez || !bez.anchors || bez.anchors.length < 2) return [];
+    const { anchors, inHandles, outHandles } = bez;
+    const n = anchors.length, out = [];
+    const steps = Math.max(1, samplesPerSeg | 0);
+    for (let i = 0; i < n - 1; i++) {
+      const [p0, c1, c2, p3] = segControls(anchors, inHandles, outHandles, i, false);
+      for (let s = 0; s < steps; s++) out.push(cubicAt(p0, c1, c2, p3, s / steps));
+    }
+    out.push([anchors[n - 1][0], anchors[n - 1][1]]);
+    return out;
+  }
+  function evalBezier(bez, samplesPerSeg = 12) {
+    return isClosed(bez) ? evalClosedBezier(bez, samplesPerSeg) : evalOpenBezier(bez, samplesPerSeg);
+  }
+  var sub = (a, b) => [a[0] - b[0], a[1] - b[1]];
+  var add = (a, b) => [a[0] + b[0], a[1] + b[1]];
+  var lerp = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+  var len = (v) => Math.hypot(v[0], v[1]);
+  function cloneBezier(bez) {
+    const n = bez.anchors.length;
+    return {
+      closed: bez.closed !== false,
+      anchors: bez.anchors.map((p) => [p[0], p[1]]),
+      inHandles: bez.inHandles.map((p) => [p[0], p[1]]),
+      outHandles: bez.outHandles.map((p) => [p[0], p[1]]),
+      // one smooth flag per anchor: truncate an over-long array, pad a too-short one with `true`
+      // (a missing flag must default to smooth, not leak `undefined` which reads as a corner).
+      smooth: Array.from({ length: n }, (_, i) => bez.smooth && i < bez.smooth.length ? bez.smooth[i] : true)
+    };
+  }
+  var inRange = (bez, i) => Number.isInteger(i) && i >= 0 && i < bez.anchors.length;
+  function moveAnchor(bez, i, pos) {
+    const b = cloneBezier(bez);
+    if (!inRange(b, i)) return b;
+    const d = sub(pos, b.anchors[i]);
+    b.anchors[i] = [pos[0], pos[1]];
+    b.outHandles[i] = add(b.outHandles[i], d);
+    b.inHandles[i] = add(b.inHandles[i], d);
+    return b;
+  }
+  function moveHandle(bez, i, which, pos) {
+    const b = cloneBezier(bez);
+    if (!inRange(b, i)) return b;
+    const a = b.anchors[i];
+    const here = which === "in" ? b.inHandles : b.outHandles;
+    const other = which === "in" ? b.outHandles : b.inHandles;
+    here[i] = [pos[0], pos[1]];
+    if (b.smooth[i]) other[i] = [2 * a[0] - pos[0], 2 * a[1] - pos[1]];
+    return b;
+  }
+  function setAnchorSmooth(bez, i, smooth) {
+    const b = cloneBezier(bez);
+    const n = b.anchors.length;
+    const endpoint = !isClosed(b) && (i === 0 || i === n - 1);
+    b.smooth[i] = endpoint ? false : !!smooth;
+    if (endpoint || !smooth) return b;
+    const a = b.anchors[i], prev = b.anchors[(i - 1 + n) % n], next = b.anchors[(i + 1) % n];
+    let dir = sub(next, prev);
+    let dl = len(dir);
+    if (dl < 1e-9) {
+      dir = sub(b.outHandles[i], a);
+      dl = len(dir);
+    }
+    if (dl < 1e-9) {
+      dir = [1, 0];
+      dl = 1;
+    }
+    dir = [dir[0] / dl, dir[1] / dl];
+    let r = (len(sub(b.outHandles[i], a)) + len(sub(b.inHandles[i], a))) / 2;
+    if (r < 1e-9) r = dl / 6;
+    b.outHandles[i] = [a[0] + dir[0] * r, a[1] + dir[1] * r];
+    b.inHandles[i] = [a[0] - dir[0] * r, a[1] - dir[1] * r];
+    return b;
+  }
+  function splitSegment(bez, seg, t) {
+    const b = cloneBezier(bez);
+    const n = b.anchors.length;
+    const j = isClosed(b) ? (seg + 1) % n : seg + 1;
+    const p0 = b.anchors[seg], p1 = b.outHandles[seg], p2 = b.inHandles[j], p3 = b.anchors[j];
+    const ab = lerp(p0, p1, t), bc = lerp(p1, p2, t), cd = lerp(p2, p3, t);
+    const abc = lerp(ab, bc, t), bcd = lerp(bc, cd, t);
+    const mid = lerp(abc, bcd, t);
+    b.outHandles[seg] = ab;
+    b.inHandles[j] = cd;
+    b.anchors.splice(seg + 1, 0, mid);
+    b.inHandles.splice(seg + 1, 0, abc);
+    b.outHandles.splice(seg + 1, 0, bcd);
+    b.smooth.splice(seg + 1, 0, true);
+    return b;
+  }
+  function normalizeOpenEndpoints(b) {
+    const n = b.anchors.length;
+    b.smooth[0] = false;
+    b.inHandles[0] = [b.anchors[0][0], b.anchors[0][1]];
+    b.smooth[n - 1] = false;
+    b.outHandles[n - 1] = [b.anchors[n - 1][0], b.anchors[n - 1][1]];
+    return b;
+  }
+  function deleteAnchor(bez, i) {
+    const floor = isClosed(bez) ? 3 : 2;
+    if (bez.anchors.length <= floor) return bez;
+    const b = cloneBezier(bez);
+    b.anchors.splice(i, 1);
+    b.inHandles.splice(i, 1);
+    b.outHandles.splice(i, 1);
+    b.smooth.splice(i, 1);
+    return isClosed(b) ? b : normalizeOpenEndpoints(b);
+  }
+  function nearestOnClosedBezier(bez, pt, samplesPerSeg = 24) {
+    if (!bez || !bez.anchors || bez.anchors.length < 3) return null;
+    const { anchors, inHandles, outHandles } = bez;
+    const n = anchors.length, steps = Math.max(2, samplesPerSeg | 0);
+    let best = null;
+    for (let i = 0; i < n; i++) {
+      const [p0, c1, c2, p3] = segControls(anchors, inHandles, outHandles, i, true);
+      for (let s = 0; s <= steps; s++) {
+        const t = s / steps, q = cubicAt(p0, c1, c2, p3, t);
+        const dx = q[0] - pt[0], dy = q[1] - pt[1], d = dx * dx + dy * dy;
+        if (!best || d < best.d2) best = { seg: i, t, point: q, d2: d };
+      }
+    }
+    return best ? { seg: best.seg, t: best.t, point: best.point, dist: Math.sqrt(best.d2) } : null;
+  }
+  function nearestOnOpenBezier(bez, pt, samplesPerSeg = 24) {
+    if (!bez || !bez.anchors || bez.anchors.length < 2) return null;
+    const { anchors, inHandles, outHandles } = bez;
+    const n = anchors.length, steps = Math.max(2, samplesPerSeg | 0);
+    let best = null;
+    for (let i = 0; i < n - 1; i++) {
+      const [p0, c1, c2, p3] = segControls(anchors, inHandles, outHandles, i, false);
+      for (let s = 0; s <= steps; s++) {
+        const t = s / steps, q = cubicAt(p0, c1, c2, p3, t);
+        const dx = q[0] - pt[0], dy = q[1] - pt[1], d = dx * dx + dy * dy;
+        if (!best || d < best.d2) best = { seg: i, t, point: q, d2: d };
+      }
+    }
+    return best ? { seg: best.seg, t: best.t, point: best.point, dist: Math.sqrt(best.d2) } : null;
+  }
+  function nearestOnBezier(bez, pt, samplesPerSeg = 24) {
+    return isClosed(bez) ? nearestOnClosedBezier(bez, pt, samplesPerSeg) : nearestOnOpenBezier(bez, pt, samplesPerSeg);
+  }
+
+  // core/svg-export.js
+  var SULCI_PATH_STYLE = "fill:none;stroke:white;stroke-width:6;stroke-opacity:0.6;stroke-linecap:round";
+  var LABEL_STYLE = "font-family:Helvetica, sans-serif;font-size:14pt;font-style:italic;fill:white;fill-opacity:1;text-anchor:middle";
+  function escapeXml(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+  }
+  function exportSulciSvg(sulci, { pathFor, ptidxFor }) {
+    if (!sulci || !sulci.length) return "";
+    const groups = /* @__PURE__ */ new Map();
+    for (const s of sulci) {
+      if (!groups.has(s.name)) groups.set(s.name, { name: s.name, ds: [], labelVert: null });
+      const g = groups.get(s.name);
+      const d = pathFor(s.bezier);
+      if (d) g.ds.push(d);
+      if (!g.labelVert && s.labelVert) g.labelVert = s.labelVert;
+    }
+    const shapes = [], labels = [];
+    for (const g of groups.values()) {
+      if (!g.ds.length) continue;
+      const name = escapeXml(g.name);
+      const paths = g.ds.map((d) => `        <path style="${SULCI_PATH_STYLE}" d="${escapeXml(d)}" />`);
+      shapes.push(`      <g inkscape:groupmode="layer" inkscape:label="${name}">
+${paths.join("\n")}
+      </g>`);
+      const ptidx = g.labelVert ? ptidxFor(g.labelVert) : null;
+      if (ptidx != null) labels.push(`      <text data-ptidx="${ptidx}" style="${LABEL_STYLE}">${name}</text>`);
+    }
+    if (!shapes.length) return "";
+    return [
+      '<g inkscape:groupmode="layer" id="sulci" inkscape:label="sulci" style="display:inline">',
+      '    <g inkscape:groupmode="layer" id="sulci_shapes" inkscape:label="shapes">',
+      shapes.join("\n"),
+      "    </g>",
+      '    <g inkscape:groupmode="layer" id="sulci_labels" inkscape:label="labels">',
+      labels.join("\n"),
+      "    </g>",
+      "</g>",
+      ""
+    ].join("\n");
+  }
+
   // adapter/pycortex-adapter.js
   var SVGNS = "http://www.w3.org/2000/svg";
   var HEMIS = ["left", "right"];
@@ -268,6 +558,8 @@ var ROIDrawBundle = (() => {
   var OUTLINE_HALO_PX = 2;
   var OUTLINE_FALLBACK_COLOR = "#ffffff";
   var LABEL_FONT_PT = 14;
+  var CURVE_STROKE_PX = 6;
+  var CURVE_STROKE_OPACITY = 0.6;
   function safeColor(c) {
     return typeof c === "string" && /^#[0-9a-fA-F]{3,8}$/.test(c) ? c : OUTLINE_FALLBACK_COLOR;
   }
@@ -607,13 +899,21 @@ var ROIDrawBundle = (() => {
       };
     }
     // --- overlay layer (occlusion-correct ROI rendering) ------------------------------
-    setOverlayLayer(name, rois) {
+    /* The overlay's drawing dimensions. Paths live in the viewBox coordinate system, NOT the
+     * (later-overwritten) width/height. Rendering and export must agree on this or the exported
+     * markup would not line up with what the user drew. */
+    _overlayDims(svgo) {
+      const vb = (svgo.svg.getAttribute("viewBox") || "").split(/[\s,]+/).map(parseFloat);
+      return {
+        W: vb.length === 4 && vb[2] ? vb[2] : svgo.width,
+        H: vb.length === 4 && vb[3] ? vb[3] : svgo.height
+      };
+    }
+    setOverlayLayer(name, shapes) {
       const svgo = this.surface.svg;
       if (!svgo || !svgo.svg || !svgo.posdata || !svgo.depth) return false;
       const doc = svgo.svg.ownerDocument;
-      const vb = (svgo.svg.getAttribute("viewBox") || "").split(/[\s,]+/).map(parseFloat);
-      const W = vb.length === 4 && vb[2] ? vb[2] : svgo.width;
-      const H = vb.length === 4 && vb[3] ? vb[3] : svgo.height;
+      const { W, H } = this._overlayDims(svgo);
       if (this._drawn) {
         try {
           if (this._drawn.labels) {
@@ -628,7 +928,7 @@ var ROIDrawBundle = (() => {
         delete svgo[name];
         this._drawn = null;
       }
-      if (!rois.length) {
+      if (!shapes.length) {
         svgo.update();
         return true;
       }
@@ -642,24 +942,27 @@ var ROIDrawBundle = (() => {
       labelsEl.setAttribute("id", name + "_labels");
       layerEl.appendChild(shapesEl);
       layerEl.appendChild(labelsEl);
-      for (const roi of rois) {
-        const d = this._roiSvgPath(roi, W, H);
+      for (const shape of shapes) {
+        const d = this._shapeSvgPath(shape, W, H);
         if (d) {
+          const sulcus = shape.kind === "sulcus";
+          const w = sulcus ? CURVE_STROKE_PX : OUTLINE_STROKE_PX;
+          const op = sulcus ? CURVE_STROKE_OPACITY : 1;
           const halo = doc.createElementNS(SVGNS, "path");
           halo.setAttribute("d", d);
-          halo.setAttribute("style", "fill:none;stroke:#ffffff;stroke-width:" + (OUTLINE_STROKE_PX + OUTLINE_HALO_PX) + ";stroke-opacity:0.9");
+          halo.setAttribute("style", "fill:none;stroke:#ffffff;stroke-width:" + (w + OUTLINE_HALO_PX) + ";stroke-opacity:0.9");
           shapesEl.appendChild(halo);
           const path = doc.createElementNS(SVGNS, "path");
           path.setAttribute("d", d);
-          path.setAttribute("style", "fill:none;stroke:" + safeColor(roi.color) + ";stroke-width:" + OUTLINE_STROKE_PX + ";stroke-opacity:1");
+          path.setAttribute("style", "fill:none;stroke:" + safeColor(shape.color) + ";stroke-width:" + w + ";stroke-opacity:" + op);
           shapesEl.appendChild(path);
         }
-        const ptidx = this._labelPtidx(roi.labelVert);
+        const ptidx = this._labelPtidx(shape.labelVert);
         if (ptidx != null) {
           const t = doc.createElementNS(SVGNS, "text");
           t.setAttribute("data-ptidx", String(ptidx));
           t.setAttribute("style", "font-family:Helvetica, sans-serif;font-size:" + LABEL_FONT_PT + "pt;font-weight:bold;font-style:italic;fill:white;fill-opacity:1;text-anchor:middle;filter:url(#dropshadow)");
-          t.appendChild(doc.createTextNode(roi.name));
+          t.appendChild(doc.createTextNode(shape.name));
           labelsEl.appendChild(t);
         }
       }
@@ -697,15 +1000,18 @@ var ROIDrawBundle = (() => {
       svgo.update();
       return true;
     }
-    // An ROI's white outline as an SVG path in overlay (flat-uv) coords: uv -> (u*W,(1-v)*H).
-    // When the ROI carries a bezier (the editable boundary), emit it as a native cubic path —
-    // genuinely smooth and compact. Otherwise fall back to a Chaikin-smoothed vertex ring (v1 ROIs).
-    _roiSvgPath(roi, W, H) {
-      if (roi.bezier && roi.bezier.anchors && roi.bezier.anchors.length >= 3)
-        return this._bezierSvgPath(roi.bezier, W, H);
-      if (!roi.outline || roi.outline.length < 3) return null;
+    // A shape's outline as an SVG path in overlay (flat-uv) coords. A bezier is emitted as a
+    // native cubic path. Only ROIs have the legacy vertex-ring fallback (v1 files); a sulcus is
+    // always bezier-backed, since it is created from a fitted open curve.
+    _shapeSvgPath(shape, W, H) {
+      if (shape.bezier && shape.bezier.anchors) {
+        const d2 = this._bezierSvgPath(shape.bezier, W, H);
+        if (d2) return d2;
+      }
+      if (shape.kind === "sulcus") return null;
+      if (!shape.outline || shape.outline.length < 3) return null;
       const pts = [];
-      for (const o of roi.outline) {
+      for (const o of shape.outline) {
         const uv = this.vertexUV(o);
         if (uv) pts.push([uv[0] * W, (1 - uv[1]) * H]);
       }
@@ -715,17 +1021,39 @@ var ROIDrawBundle = (() => {
       for (let i = 1; i < c.length; i++) d += "L" + c[i][0].toFixed(2) + "," + c[i][1].toFixed(2);
       return d + "Z";
     }
-    // Closed cubic-bezier path from {anchors,inHandles,outHandles} in flat-uv -> viewBox px.
+    // Cubic-bezier path from {anchors,inHandles,outHandles} in flat-uv -> viewBox px. This IS
+    // pycortex's overlay coordinate space, so the `d` we emit here is directly usable in an
+    // overlays.svg. A CLOSED bezier wraps back to anchor 0 and ends with `Z`; an OPEN one (a
+    // sulcus) has n-1 segments and MUST NOT close — the missing `Z` is exactly what distinguishes
+    // a sulcus from an ROI on disk.
     _bezierSvgPath(bez, W, H) {
       const { anchors, inHandles, outHandles } = bez;
       const n = anchors.length;
+      const closed = isClosed(bez);
+      if (n < (closed ? 3 : 2)) return null;
       const P = (uv) => (uv[0] * W).toFixed(2) + "," + ((1 - uv[1]) * H).toFixed(2);
       let d = "M" + P(anchors[0]);
-      for (let i = 0; i < n; i++) {
-        const j = (i + 1) % n;
+      const segs = segCount(bez);
+      for (let i = 0; i < segs; i++) {
+        const j = closed ? (i + 1) % n : i + 1;
         d += "C" + P(outHandles[i]) + " " + P(inHandles[j]) + " " + P(anchors[j]);
       }
-      return d + "Z";
+      return closed ? d + "Z" : d;
+    }
+    /*
+     * Serialize drawn sulci as a pycortex overlays.svg fragment. The `d` strings come from the
+     * SAME uv->viewBox mapping the live overlay uses, which is pycortex's own overlay coordinate
+     * space — so the output drops straight into a subject's overlays.svg. Returns "" if the
+     * overlay isn't loaded yet or there are no sulci.
+     */
+    exportSulciMarkup(sulci) {
+      const svgo = this.surface.svg;
+      if (!svgo || !svgo.svg) return "";
+      const { W, H } = this._overlayDims(svgo);
+      return exportSulciSvg(sulci, {
+        pathFor: (bez) => bez ? this._bezierSvgPath(bez, W, H) : null,
+        ptidxFor: (lv) => this._labelPtidx(lv)
+      });
     }
     _labelPtidx(lv) {
       if (!lv) return null;
@@ -827,47 +1155,51 @@ var ROIDrawBundle = (() => {
     }
   };
 
-  // core/roi-model.js
+  // core/shape-model.js
   var FORMAT = "pycortex-roidraw/vertexset-v2";
   var PALETTE = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4", "#46f0f0", "#f032e6", "#bcf60c"];
-  var ROISet = class {
+  var ShapeSet = class {
     constructor() {
-      this.rois = [];
+      this.shapes = [];
       this.nextId = 1;
     }
     get length() {
-      return this.rois.length;
+      return this.shapes.length;
+    }
+    byKind(kind) {
+      return this.shapes.filter((s) => s.kind === kind);
     }
     nextColor() {
       return PALETTE[(this.nextId - 1) % PALETTE.length];
     }
-    add({ name, color, left, right, outline = null, labelVert = null, bezier = null }) {
-      const roi = {
-        id: this.nextId++,
-        name,
-        color: color || this.nextColor(),
-        left,
-        right,
-        outline,
-        labelVert,
-        bezier
-      };
-      this.rois.push(roi);
-      return roi;
+    /* An ROI carries membership (left/right/outline); a sulcus carries only its open bezier and a
+     * label vertex. Vertex fields are omitted entirely for sulci rather than set to empty arrays,
+     * so a downstream reader can't mistake "no membership" for "membership of nothing". */
+    add({ kind = "roi", name, color, left, right, outline = null, labelVert = null, bezier = null }) {
+      const shape = { id: this.nextId++, kind, name, color: color || this.nextColor(), labelVert, bezier };
+      if (kind === "roi") {
+        shape.left = left;
+        shape.right = right;
+        shape.outline = outline;
+      }
+      this.shapes.push(shape);
+      return shape;
     }
     remove(id) {
-      this.rois = this.rois.filter((r) => r.id !== id);
+      this.shapes = this.shapes.filter((s) => s.id !== id);
     }
     clear() {
-      this.rois = [];
+      this.shapes = [];
     }
+    /* The vertexset-v2 document is an ROI format: it describes per-hemisphere vertex membership,
+     * which a sulcus does not have. Unchanged from v2 on purpose; v1/v2 files keep importing. */
     toJSON(surfaceId) {
       return {
         format: FORMAT,
         generated: (/* @__PURE__ */ new Date()).toISOString(),
         surface: surfaceId || null,
         note: "Per-hemisphere subject vertex indices + an ordered boundary ring (outline) + an editable flat-UV bezier. Portable to any viewer built on the same surface.",
-        rois: this.rois.map((r) => ({
+        rois: this.byKind("roi").map((r) => ({
           name: r.name,
           color: r.color,
           counts: { left: r.left.length, right: r.right.length },
@@ -878,7 +1210,8 @@ var ROIDrawBundle = (() => {
         }))
       };
     }
-    /* Append ROIs from a parsed document. Returns the ROIs added. Throws on an unknown format.
+    /* Append ROIs from a parsed document. A vertexset document only ever holds ROIs, so every
+     * entry is tagged kind:"roi". Returns the shapes added. Throws on an unknown format.
      * Purely structural: arrays are defensively copied so the model never aliases the caller's
      * parsed JSON, and a missing labelVert is left null (the viewer back-fills it from geometry —
      * see draw-pipeline.backfillLabel — so reloaded ROIs label the same way freshly drawn ones do). */
@@ -889,6 +1222,7 @@ var ROIDrawBundle = (() => {
       for (const r of doc.rois || []) {
         const v = r.vertices || {};
         added.push(this.add({
+          kind: "roi",
           name: r.name || "roi" + this.nextId,
           color: r.color,
           left: (v.left || []).slice(),
@@ -1017,385 +1351,6 @@ var ROIDrawBundle = (() => {
     return best;
   }
 
-  // core/bezier.js
-  var UV_RDP_EPSILON = 4e-3;
-  function catmullRomHandles(anchors) {
-    const n = anchors.length;
-    const inHandles = new Array(n), outHandles = new Array(n);
-    for (let i = 0; i < n; i++) {
-      const prev = anchors[(i - 1 + n) % n], next = anchors[(i + 1) % n], a = anchors[i];
-      const tx = (next[0] - prev[0]) / 6, ty = (next[1] - prev[1]) / 6;
-      outHandles[i] = [a[0] + tx, a[1] + ty];
-      inHandles[i] = [a[0] - tx, a[1] - ty];
-    }
-    return { inHandles, outHandles };
-  }
-  function bezierFromAnchors(anchors) {
-    const a = anchors.map((p) => [p[0], p[1]]);
-    const { inHandles, outHandles } = catmullRomHandles(a);
-    return { closed: true, anchors: a, inHandles, outHandles, smooth: a.map(() => true) };
-  }
-  function rotateToExtreme(pts) {
-    const c = centroid(pts);
-    if (!c) return pts;
-    let bi = 0, bd = -1;
-    for (let i = 0; i < pts.length; i++) {
-      const dx = pts[i][0] - c[0], dy = pts[i][1] - c[1], d = dx * dx + dy * dy;
-      if (d > bd) {
-        bd = d;
-        bi = i;
-      }
-    }
-    return bi === 0 ? pts : pts.slice(bi).concat(pts.slice(0, bi));
-  }
-  function fitClosedBezier(ring, { epsilon = UV_RDP_EPSILON } = {}) {
-    if (!ring || ring.length < 3) return null;
-    let pts = ring.slice();
-    const f = pts[0], l = pts[pts.length - 1];
-    if (pts.length > 3 && f[0] === l[0] && f[1] === l[1]) pts.pop();
-    pts = rotateToExtreme(pts);
-    let anchors = simplifyRDP(pts, epsilon);
-    if (anchors.length < 3) anchors = pts;
-    if (anchors.length > 3) {
-      const a0 = anchors[0], aN = anchors[anchors.length - 1];
-      if (a0[0] === aN[0] && a0[1] === aN[1]) anchors.pop();
-    }
-    if (anchors.length < 3) return null;
-    return bezierFromAnchors(anchors);
-  }
-  function cubicAt(p0, c1, c2, p3, t) {
-    const mt = 1 - t, a = mt * mt * mt, b = 3 * mt * mt * t, c = 3 * mt * t * t, d = t * t * t;
-    return [
-      a * p0[0] + b * c1[0] + c * c2[0] + d * p3[0],
-      a * p0[1] + b * c1[1] + c * c2[1] + d * p3[1]
-    ];
-  }
-  function segControls(anchors, inHandles, outHandles, i) {
-    const j = (i + 1) % anchors.length;
-    return [anchors[i], outHandles[i], inHandles[j], anchors[j]];
-  }
-  function evalClosedBezier(bez, samplesPerSeg = 12) {
-    if (!bez || !bez.anchors || bez.anchors.length < 3) return [];
-    const { anchors, inHandles, outHandles } = bez;
-    const n = anchors.length, out = [];
-    const steps = Math.max(1, samplesPerSeg | 0);
-    for (let i = 0; i < n; i++) {
-      const [p0, c1, c2, p3] = segControls(anchors, inHandles, outHandles, i);
-      for (let s = 0; s < steps; s++) out.push(cubicAt(p0, c1, c2, p3, s / steps));
-    }
-    return out;
-  }
-  var sub = (a, b) => [a[0] - b[0], a[1] - b[1]];
-  var add = (a, b) => [a[0] + b[0], a[1] + b[1]];
-  var lerp = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
-  var len = (v) => Math.hypot(v[0], v[1]);
-  function cloneBezier(bez) {
-    const n = bez.anchors.length;
-    return {
-      closed: bez.closed !== false,
-      anchors: bez.anchors.map((p) => [p[0], p[1]]),
-      inHandles: bez.inHandles.map((p) => [p[0], p[1]]),
-      outHandles: bez.outHandles.map((p) => [p[0], p[1]]),
-      // one smooth flag per anchor: truncate an over-long array, pad a too-short one with `true`
-      // (a missing flag must default to smooth, not leak `undefined` which reads as a corner).
-      smooth: Array.from({ length: n }, (_, i) => bez.smooth && i < bez.smooth.length ? bez.smooth[i] : true)
-    };
-  }
-  function moveAnchor(bez, i, pos) {
-    const b = cloneBezier(bez);
-    const d = sub(pos, b.anchors[i]);
-    b.anchors[i] = [pos[0], pos[1]];
-    b.outHandles[i] = add(b.outHandles[i], d);
-    b.inHandles[i] = add(b.inHandles[i], d);
-    return b;
-  }
-  function moveHandle(bez, i, which, pos) {
-    const b = cloneBezier(bez);
-    const a = b.anchors[i];
-    const here = which === "in" ? b.inHandles : b.outHandles;
-    const other = which === "in" ? b.outHandles : b.inHandles;
-    here[i] = [pos[0], pos[1]];
-    if (b.smooth[i]) other[i] = [2 * a[0] - pos[0], 2 * a[1] - pos[1]];
-    return b;
-  }
-  function setAnchorSmooth(bez, i, smooth) {
-    const b = cloneBezier(bez);
-    b.smooth[i] = !!smooth;
-    if (!smooth) return b;
-    const n = b.anchors.length;
-    const a = b.anchors[i], prev = b.anchors[(i - 1 + n) % n], next = b.anchors[(i + 1) % n];
-    let dir = sub(next, prev);
-    let dl = len(dir);
-    if (dl < 1e-9) {
-      dir = sub(b.outHandles[i], a);
-      dl = len(dir);
-    }
-    if (dl < 1e-9) {
-      dir = [1, 0];
-      dl = 1;
-    }
-    dir = [dir[0] / dl, dir[1] / dl];
-    let r = (len(sub(b.outHandles[i], a)) + len(sub(b.inHandles[i], a))) / 2;
-    if (r < 1e-9) r = dl / 6;
-    b.outHandles[i] = [a[0] + dir[0] * r, a[1] + dir[1] * r];
-    b.inHandles[i] = [a[0] - dir[0] * r, a[1] - dir[1] * r];
-    return b;
-  }
-  function splitSegment(bez, seg, t) {
-    const b = cloneBezier(bez);
-    const n = b.anchors.length;
-    const j = (seg + 1) % n;
-    const p0 = b.anchors[seg], p1 = b.outHandles[seg], p2 = b.inHandles[j], p3 = b.anchors[j];
-    const ab = lerp(p0, p1, t), bc = lerp(p1, p2, t), cd = lerp(p2, p3, t);
-    const abc = lerp(ab, bc, t), bcd = lerp(bc, cd, t);
-    const mid = lerp(abc, bcd, t);
-    b.outHandles[seg] = ab;
-    b.inHandles[j] = cd;
-    b.anchors.splice(seg + 1, 0, mid);
-    b.inHandles.splice(seg + 1, 0, abc);
-    b.outHandles.splice(seg + 1, 0, bcd);
-    b.smooth.splice(seg + 1, 0, true);
-    return b;
-  }
-  function deleteAnchor(bez, i) {
-    if (bez.anchors.length <= 3) return bez;
-    const b = cloneBezier(bez);
-    b.anchors.splice(i, 1);
-    b.inHandles.splice(i, 1);
-    b.outHandles.splice(i, 1);
-    b.smooth.splice(i, 1);
-    return b;
-  }
-  function nearestOnClosedBezier(bez, pt, samplesPerSeg = 24) {
-    if (!bez || !bez.anchors || bez.anchors.length < 3) return null;
-    const { anchors, inHandles, outHandles } = bez;
-    const n = anchors.length, steps = Math.max(2, samplesPerSeg | 0);
-    let best = null;
-    for (let i = 0; i < n; i++) {
-      const [p0, c1, c2, p3] = segControls(anchors, inHandles, outHandles, i);
-      for (let s = 0; s <= steps; s++) {
-        const t = s / steps, q = cubicAt(p0, c1, c2, p3, t);
-        const dx = q[0] - pt[0], dy = q[1] - pt[1], d = dx * dx + dy * dy;
-        if (!best || d < best.d2) best = { seg: i, t, point: q, d2: d };
-      }
-    }
-    return best ? { seg: best.seg, t: best.t, point: best.point, dist: Math.sqrt(best.d2) } : null;
-  }
-
-  // draw-pipeline.js
-  var BEZIER_SAMPLES = 16;
-  var OUTLINE_EPS_UV = 3e-3;
-  function ringToUv(adapter, ring) {
-    if (!ring) return null;
-    const uv = [];
-    for (const o of ring) {
-      const p = adapter.vertexUV(o);
-      if (p) uv.push(p);
-    }
-    return uv;
-  }
-  function backfillBezier(adapter, ring) {
-    const ringUv = ringToUv(adapter, ring);
-    return ringUv && ringUv.length >= 3 ? fitClosedBezier(ringUv) : null;
-  }
-  function backfillLabel(adapter, ring) {
-    if (!ring) return null;
-    const sel = { left: [], right: [], px: { left: [], right: [] } };
-    for (const o of ring) {
-      const uv = adapter.vertexUV(o);
-      if (uv) {
-        sel[o.h].push(o.g);
-        sel.px[o.h].push(uv);
-      }
-    }
-    return pickLabelVertex(sel);
-  }
-  function roiFromBezier(adapter, bezier) {
-    const poly = evalClosedBezier(bezier, BEZIER_SAMPLES);
-    if (poly.length < 3) return null;
-    const all = adapter.allVertexUV();
-    const projectedUv = { left: { idx: all.left.idx, px: all.left.uv }, right: { idx: all.right.idx, px: all.right.uv } };
-    const sel = selectInPolygon(projectedUv, poly);
-    const outline = buildOutline(poly, sel, { epsilon: OUTLINE_EPS_UV });
-    return { left: sel.left, right: sel.right, outline, labelVert: pickLabelVertex(sel), total: sel.total };
-  }
-  function deriveRoiFromLasso(adapter, pts) {
-    const projected = adapter.projectVertices({ subsample: 1 });
-    const sel0 = selectInPolygon(projected, pts);
-    if (!sel0.total) return { left: [], right: [], outline: null, labelVert: null, bezier: null, total: 0 };
-    const lassoRing = buildOutline(pts, sel0);
-    const ringUv = ringToUv(adapter, lassoRing);
-    const fitted = ringUv && ringUv.length >= 3 ? fitClosedBezier(ringUv) : null;
-    const derived = fitted ? roiFromBezier(adapter, fitted) : null;
-    if (derived && derived.total)
-      return { left: derived.left, right: derived.right, outline: derived.outline, labelVert: derived.labelVert, bezier: fitted, total: derived.total };
-    return {
-      left: sel0.left,
-      right: sel0.right,
-      outline: lassoRing,
-      labelVert: pickLabelVertex(sel0),
-      bezier: null,
-      total: sel0.total
-    };
-  }
-
-  // ui/lasso-overlay.js
-  var DRAG_THRESHOLD = 4;
-  var LASSO_STROKE = "#ffcc00";
-  var LASSO_WIDTH = 1.5;
-  var LassoOverlay = class {
-    constructor(adapter, { onLasso, onInspect } = {}) {
-      this.adapter = adapter;
-      this.onLasso = onLasso || (() => {
-      });
-      this.onInspect = onInspect || (() => {
-      });
-      this.active = false;
-      this.passthrough = false;
-      this.drawing = false;
-      this.lasso = [];
-      this._gesture = "none";
-      this._downPt = null;
-      this._panLast = null;
-      this._moved = false;
-      const el = document.createElement("canvas");
-      el.className = "roidraw-overlay";
-      document.body.appendChild(el);
-      this.el = el;
-      this.ctx = el.getContext("2d");
-      this._onResize = () => this.syncRect();
-      window.addEventListener("resize", this._onResize);
-      el.addEventListener("mousedown", (e) => this._onDown(e));
-      el.addEventListener("mousemove", (e) => this._onMove(e));
-      el.addEventListener("mouseup", (e) => this._onUp(e));
-      el.addEventListener("mouseleave", (e) => {
-        if (this._gesture !== "none") this._onUp(e);
-      });
-      el.addEventListener("wheel", (e) => this._onWheel(e), { passive: false });
-      this.syncRect();
-      setTimeout(() => this.syncRect(), 800);
-    }
-    syncRect() {
-      const r = this.adapter.canvas().getBoundingClientRect();
-      const w = Math.max(1, Math.round(r.width));
-      const h = Math.max(1, Math.round(r.height));
-      this.el.style.left = Math.round(r.left) + "px";
-      this.el.style.top = Math.round(r.top) + "px";
-      this.el.style.width = w + "px";
-      this.el.style.height = h + "px";
-      this.el.width = w;
-      this.el.height = h;
-      this._redraw();
-    }
-    setActive(on) {
-      this.active = on;
-      this.passthrough = false;
-      this._gesture = "none";
-      this.el.style.pointerEvents = on ? "auto" : "none";
-      if (on) this.syncRect();
-      else this._cancel();
-      this._applyMode();
-    }
-    // Shift held: a drag pans the surface (so you can zoom/pan in to draw fine detail), and a
-    // click (no drag) inspects the voxel underneath. Plain drag (no Shift) is the lasso.
-    setPassthrough(on) {
-      if (!this.active || this._gesture !== "none" || on === this.passthrough) return;
-      this.passthrough = on;
-      this._applyMode();
-    }
-    _applyMode() {
-      const nav = this.active && this.passthrough;
-      this.el.classList.toggle("roidraw-overlay--active", this.active && !nav);
-      this.el.classList.toggle("roidraw-overlay--inspect", nav);
-      this.el.style.cursor = nav ? "grab" : this.active ? "crosshair" : "default";
-    }
-    _evtPt(e) {
-      const r = this.el.getBoundingClientRect();
-      return [e.clientX - r.left, e.clientY - r.top];
-    }
-    _onDown(e) {
-      if (!this.active) return;
-      e.preventDefault();
-      this._downPt = this._evtPt(e);
-      if (this.passthrough) {
-        this._gesture = "shift";
-        this._panLast = this._downPt;
-        this._moved = false;
-      } else {
-        this._gesture = "lasso";
-        this.drawing = true;
-        this.lasso = [this._downPt];
-      }
-    }
-    _onMove(e) {
-      if (this._gesture === "shift") {
-        const p = this._evtPt(e);
-        if (!this._moved && (Math.abs(p[0] - this._downPt[0]) > DRAG_THRESHOLD || Math.abs(p[1] - this._downPt[1]) > DRAG_THRESHOLD)) {
-          this._moved = true;
-          this.el.style.cursor = "grabbing";
-        }
-        if (this._moved) {
-          this.adapter.pan(p[0] - this._panLast[0], p[1] - this._panLast[1]);
-          this._panLast = p;
-        }
-        return;
-      }
-      if (this._gesture !== "lasso") return;
-      e.preventDefault();
-      this.lasso.push(this._evtPt(e));
-      this._redraw();
-    }
-    _onUp(e) {
-      const g = this._gesture;
-      this._gesture = "none";
-      if (g === "shift") {
-        if (!this._moved) {
-          const p = this._evtPt(e);
-          this.onInspect(p[0], p[1]);
-        }
-        this._applyMode();
-        return;
-      }
-      if (g !== "lasso") return;
-      this.drawing = false;
-      const pts = this.lasso;
-      this.lasso = [];
-      this._redraw();
-      if (pts.length >= 3) this.onLasso(pts);
-    }
-    _onWheel(e) {
-      if (!this.active) return;
-      e.preventDefault();
-      this.adapter.zoom(e.deltaY);
-    }
-    _cancel() {
-      this.drawing = false;
-      this._gesture = "none";
-      this.lasso = [];
-      this._redraw();
-    }
-    cancel() {
-      this._cancel();
-    }
-    _redraw() {
-      const ctx = this.ctx;
-      if (!ctx) return;
-      ctx.clearRect(0, 0, this.el.width, this.el.height);
-      if (this.lasso.length > 1) {
-        ctx.strokeStyle = LASSO_STROKE;
-        ctx.lineWidth = LASSO_WIDTH;
-        ctx.beginPath();
-        ctx.moveTo(this.lasso[0][0], this.lasso[0][1]);
-        for (let j = 1; j < this.lasso.length; j++) ctx.lineTo(this.lasso[j][0], this.lasso[j][1]);
-        ctx.stroke();
-      }
-    }
-    destroy() {
-      window.removeEventListener("resize", this._onResize);
-      if (this.el.parentNode) this.el.parentNode.removeChild(this.el);
-    }
-  };
-
   // core/transform.js
   var PIVOT_EPS = 1e-12;
   var W_EPS = 1e-12;
@@ -1507,6 +1462,291 @@ var ROIDrawBundle = (() => {
     ];
   }
 
+  // draw-pipeline.js
+  var BEZIER_SAMPLES = 16;
+  var OUTLINE_EPS_UV = 3e-3;
+  var TRACE_SAMPLES = 24;
+  var ALL_UV_BOUNDS = { minu: -Infinity, maxu: Infinity, minv: -Infinity, maxv: Infinity };
+  function ringToUv(adapter, ring) {
+    if (!ring) return null;
+    const uv = [];
+    for (const o of ring) {
+      const p = adapter.vertexUV(o);
+      if (p) uv.push(p);
+    }
+    return uv;
+  }
+  function backfillBezier(adapter, ring) {
+    const ringUv = ringToUv(adapter, ring);
+    return ringUv && ringUv.length >= 3 ? fitClosedBezier(ringUv) : null;
+  }
+  function backfillLabel(adapter, ring) {
+    if (!ring) return null;
+    const sel = { left: [], right: [], px: { left: [], right: [] } };
+    for (const o of ring) {
+      const uv = adapter.vertexUV(o);
+      if (uv) {
+        sel[o.h].push(o.g);
+        sel.px[o.h].push(uv);
+      }
+    }
+    return pickLabelVertex(sel);
+  }
+  function roiFromBezier(adapter, bezier) {
+    const poly = evalClosedBezier(bezier, BEZIER_SAMPLES);
+    if (poly.length < 3) return null;
+    const all = adapter.allVertexUV();
+    const projectedUv = { left: { idx: all.left.idx, px: all.left.uv }, right: { idx: all.right.idx, px: all.right.uv } };
+    const sel = selectInPolygon(projectedUv, poly);
+    const outline = buildOutline(poly, sel, { epsilon: OUTLINE_EPS_UV });
+    return { left: sel.left, right: sel.right, outline, labelVert: pickLabelVertex(sel), total: sel.total };
+  }
+  function deriveRoiFromLasso(adapter, pts) {
+    const projected = adapter.projectVertices({ subsample: 1 });
+    const sel0 = selectInPolygon(projected, pts);
+    if (!sel0.total) return { left: [], right: [], outline: null, labelVert: null, bezier: null, total: 0 };
+    const lassoRing = buildOutline(pts, sel0);
+    const ringUv = ringToUv(adapter, lassoRing);
+    const fitted = ringUv && ringUv.length >= 3 ? fitClosedBezier(ringUv) : null;
+    const derived = fitted ? roiFromBezier(adapter, fitted) : null;
+    if (derived && derived.total)
+      return { left: derived.left, right: derived.right, outline: derived.outline, labelVert: derived.labelVert, bezier: fitted, total: derived.total };
+    return {
+      left: sel0.left,
+      right: sel0.right,
+      outline: lassoRing,
+      labelVert: pickLabelVertex(sel0),
+      bezier: null,
+      total: sel0.total
+    };
+  }
+  function nearestVertexTo(adapter, uv) {
+    const all = adapter.allVertexUV();
+    let best = null, bd = Infinity;
+    for (const h of ["left", "right"]) {
+      const p = all[h];
+      if (!p) continue;
+      for (let k = 0; k < p.uv.length; k++) {
+        const dx = p.uv[k][0] - uv[0], dy = p.uv[k][1] - uv[1], d = dx * dx + dy * dy;
+        if (d < bd) {
+          bd = d;
+          best = { h, g: p.idx[k] };
+        }
+      }
+    }
+    return best;
+  }
+  function correspondences(adapter) {
+    const proj = adapter.projectVerticesInUvBounds(ALL_UV_BOUNDS);
+    const src = [], dst = [];
+    for (const h of ["left", "right"]) {
+      const p = proj[h];
+      if (!p) continue;
+      for (let i = 0; i < p.uv.length; i++) {
+        src.push(p.uv[i]);
+        dst.push(p.px[i]);
+      }
+    }
+    return { src, dst };
+  }
+  function labelForCurve(adapter, bezier) {
+    const poly = evalOpenBezier(bezier, TRACE_SAMPLES);
+    const mid = poly[poly.length >> 1];
+    return mid ? nearestVertexTo(adapter, mid) : null;
+  }
+  function curveFromTrace(adapter, pts) {
+    if (!pts || pts.length < 2) return null;
+    const c = correspondences(adapter);
+    if (c.src.length < 4) return null;
+    const H = fitHomography(c.src, c.dst);
+    if (!H) return null;
+    const Hinv = invertHomography(H);
+    if (!Hinv) return null;
+    const bezier = fitOpenBezier(pts.map((p) => applyHomography(Hinv, p)));
+    if (!bezier) return null;
+    return { bezier, labelVert: labelForCurve(adapter, bezier) };
+  }
+
+  // ui/lasso-overlay.js
+  var DRAG_THRESHOLD = 4;
+  var LASSO_STROKE = "#ffcc00";
+  var LASSO_WIDTH = 1.5;
+  var LassoOverlay = class {
+    constructor(adapter, { onLasso, onInspect, onTrace } = {}) {
+      this.adapter = adapter;
+      this.onLasso = onLasso || (() => {
+      });
+      this.onTrace = onTrace || (() => {
+      });
+      this.onInspect = onInspect || (() => {
+      });
+      this.active = false;
+      this.passthrough = false;
+      this.drawing = false;
+      this.tool = "lasso";
+      this.lasso = [];
+      this._gesture = "none";
+      this._downPt = null;
+      this._panLast = null;
+      this._moved = false;
+      const el = document.createElement("canvas");
+      el.className = "roidraw-overlay";
+      document.body.appendChild(el);
+      this.el = el;
+      this.ctx = el.getContext("2d");
+      this._onResize = () => this.syncRect();
+      window.addEventListener("resize", this._onResize);
+      el.addEventListener("mousedown", (e) => this._onDown(e));
+      el.addEventListener("mousemove", (e) => this._onMove(e));
+      el.addEventListener("mouseup", (e) => this._onUp(e));
+      el.addEventListener("mouseleave", (e) => {
+        if (this._gesture !== "none") this._onUp(e);
+      });
+      el.addEventListener("wheel", (e) => this._onWheel(e), { passive: false });
+      this.syncRect();
+      setTimeout(() => this.syncRect(), 800);
+    }
+    syncRect() {
+      const r = this.adapter.canvas().getBoundingClientRect();
+      const w = Math.max(1, Math.round(r.width));
+      const h = Math.max(1, Math.round(r.height));
+      this.el.style.left = Math.round(r.left) + "px";
+      this.el.style.top = Math.round(r.top) + "px";
+      this.el.style.width = w + "px";
+      this.el.style.height = h + "px";
+      this.el.width = w;
+      this.el.height = h;
+      this._redraw();
+    }
+    setActive(on) {
+      this.active = on;
+      this.passthrough = false;
+      this._gesture = "none";
+      this.el.style.pointerEvents = on ? "auto" : "none";
+      if (on) this.syncRect();
+      else this._cancel();
+      this._applyMode();
+    }
+    // Shift held: a drag pans the surface (so you can zoom/pan in to draw fine detail), and a
+    // click (no drag) inspects the voxel underneath. Plain drag (no Shift) is the lasso.
+    setPassthrough(on) {
+      if (!this.active || this._gesture !== "none" || on === this.passthrough) return;
+      this.passthrough = on;
+      this._applyMode();
+    }
+    /* Which gesture a plain drag performs: a closed ROI lasso, or an open sulcus trace. */
+    setTool(tool) {
+      const t = tool === "trace" ? "trace" : "lasso";
+      if (t === this.tool) return;
+      this.tool = t;
+      this._cancel();
+    }
+    _applyMode() {
+      const nav = this.active && this.passthrough;
+      this.el.classList.toggle("roidraw-overlay--active", this.active && !nav);
+      this.el.classList.toggle("roidraw-overlay--inspect", nav);
+      this.el.style.cursor = nav ? "grab" : this.active ? "crosshair" : "default";
+    }
+    _evtPt(e) {
+      const r = this.el.getBoundingClientRect();
+      return [e.clientX - r.left, e.clientY - r.top];
+    }
+    _onDown(e) {
+      if (!this.active) return;
+      e.preventDefault();
+      this._downPt = this._evtPt(e);
+      if (this.passthrough) {
+        this._gesture = "shift";
+        this._panLast = this._downPt;
+        this._moved = false;
+      } else {
+        this._gesture = "lasso";
+        this.drawing = true;
+        this.lasso = [this._downPt];
+      }
+    }
+    _onMove(e) {
+      if (this._gesture === "shift") {
+        const p = this._evtPt(e);
+        if (!this._moved && (Math.abs(p[0] - this._downPt[0]) > DRAG_THRESHOLD || Math.abs(p[1] - this._downPt[1]) > DRAG_THRESHOLD)) {
+          this._moved = true;
+          this.el.style.cursor = "grabbing";
+        }
+        if (this._moved) {
+          this.adapter.pan(p[0] - this._panLast[0], p[1] - this._panLast[1]);
+          this._panLast = p;
+        }
+        return;
+      }
+      if (this._gesture !== "lasso") return;
+      e.preventDefault();
+      this.lasso.push(this._evtPt(e));
+      this._redraw();
+    }
+    _onUp(e) {
+      const g = this._gesture;
+      this._gesture = "none";
+      if (g === "shift") {
+        if (!this._moved) {
+          const p = this._evtPt(e);
+          this.onInspect(p[0], p[1]);
+        }
+        this._applyMode();
+        return;
+      }
+      if (g !== "lasso") return;
+      this.drawing = false;
+      const pts = this.lasso;
+      this.lasso = [];
+      this._redraw();
+      if (this.tool === "trace") {
+        if (pts.length >= 2) {
+          let minX = pts[0][0], maxX = pts[0][0], minY = pts[0][1], maxY = pts[0][1];
+          for (let j = 1; j < pts.length; j++) {
+            minX = Math.min(minX, pts[j][0]);
+            maxX = Math.max(maxX, pts[j][0]);
+            minY = Math.min(minY, pts[j][1]);
+            maxY = Math.max(maxY, pts[j][1]);
+          }
+          if (Math.hypot(maxX - minX, maxY - minY) > DRAG_THRESHOLD) this.onTrace(pts);
+        }
+        return;
+      }
+      if (pts.length >= 3) this.onLasso(pts);
+    }
+    _onWheel(e) {
+      if (!this.active) return;
+      e.preventDefault();
+      this.adapter.zoom(e.deltaY);
+    }
+    _cancel() {
+      this.drawing = false;
+      this._gesture = "none";
+      this.lasso = [];
+      this._redraw();
+    }
+    cancel() {
+      this._cancel();
+    }
+    _redraw() {
+      const ctx = this.ctx;
+      if (!ctx) return;
+      ctx.clearRect(0, 0, this.el.width, this.el.height);
+      if (this.lasso.length > 1) {
+        ctx.strokeStyle = LASSO_STROKE;
+        ctx.lineWidth = LASSO_WIDTH;
+        ctx.beginPath();
+        ctx.moveTo(this.lasso[0][0], this.lasso[0][1]);
+        for (let j = 1; j < this.lasso.length; j++) ctx.lineTo(this.lasso[j][0], this.lasso[j][1]);
+        ctx.stroke();
+      }
+    }
+    destroy() {
+      window.removeEventListener("resize", this._onResize);
+      if (this.el.parentNode) this.el.parentNode.removeChild(this.el);
+    }
+  };
+
   // ui/overlay-geom.js
   function nearestWithin(points, pt, radius) {
     let best = -1, bd = radius * radius;
@@ -1555,6 +1795,7 @@ var ROIDrawBundle = (() => {
     anchorSel: "#fff"
   };
   var now = () => typeof performance !== "undefined" ? performance.now() : Date.now();
+  var minAnchors = (bez) => isClosed(bez) ? 3 : 2;
   var BezierEditOverlay = class {
     constructor(adapter, { onEdit } = {}) {
       this.adapter = adapter;
@@ -1633,7 +1874,7 @@ var ROIDrawBundle = (() => {
     // so caching this lets the per-frame tracking loop just re-map it through the new homography
     // instead of rebuilding + re-sampling the curve every frame.
     _recurve() {
-      this._uvPoly = this.bez && this.bez.anchors.length >= 3 ? evalClosedBezier(this.bez, CURVE_SAMPLES) : null;
+      this._uvPoly = this.bez && this.bez.anchors.length >= minAnchors(this.bez) ? evalBezier(this.bez, CURVE_SAMPLES) : null;
     }
     // The viewer applies a camera change on its NEXT render frame, so reprojecting synchronously in
     // a wheel/pan handler reads a stale camera (knots lag the surface by a frame, and a damped zoom
@@ -1661,7 +1902,7 @@ var ROIDrawBundle = (() => {
     // drifts (the curve sits slightly inside the baked outline), but around a single ROI it's
     // near-exact. Falls back to the whole flatmap only if the local region is too sparse on screen.
     reproject() {
-      if (!this.bez || this.bez.anchors.length < 3) {
+      if (!this.bez || this.bez.anchors.length < minAnchors(this.bez)) {
         this._clear();
         return;
       }
@@ -1717,7 +1958,7 @@ var ROIDrawBundle = (() => {
     _hitCurve(pt) {
       if (!this.Hinv || !this.H) return null;
       const uv = applyHomography(this.Hinv, pt);
-      const hit = nearestOnClosedBezier(this.bez, uv, CURVE_HIT_SAMPLES);
+      const hit = nearestOnBezier(this.bez, uv, CURVE_HIT_SAMPLES);
       if (!hit) return null;
       const px = applyHomography(this.H, hit.point);
       const dx = px[0] - pt[0], dy = px[1] - pt[1];
@@ -1806,6 +2047,7 @@ var ROIDrawBundle = (() => {
       const c = this._hitCurve(pt);
       if (c) {
         this.bez = splitSegment(this.bez, c.seg, c.t);
+        this._invalidatePointerTargets();
         this._select(c.seg + 1);
         this._recurve();
         this._commit();
@@ -1814,6 +2056,16 @@ var ROIDrawBundle = (() => {
     }
     _hitTestAnchorOnly(pt) {
       return nearestWithin(this._anchorPx, pt, HIT_RADIUS);
+    }
+    /* Drop every pointer target that names an anchor by index. Call whenever the anchor list
+     * changes underneath one: a stale `_drag.i` would be written through on the next mousemove
+     * (moving the wrong anchor), and a stale `_hover.i` would draw the wrong anchor enlarged. */
+    _invalidatePointerTargets() {
+      this._drag = null;
+      this._dragMoved = false;
+      this._downPt = null;
+      this._hover = null;
+      this.el.style.cursor = "default";
     }
     _onKeyDown(e) {
       if (!this.roi || this._sel < 0) return;
@@ -1824,6 +2076,7 @@ var ROIDrawBundle = (() => {
       const before = this.bez.anchors.length;
       this.bez = deleteAnchor(this.bez, this._sel);
       if (this.bez.anchors.length === before) return;
+      this._invalidatePointerTargets();
       this._sel = -1;
       this._recurve();
       this._commit();
@@ -1857,18 +2110,21 @@ var ROIDrawBundle = (() => {
       ctx.beginPath();
       ctx.moveTo(poly[0][0], poly[0][1]);
       for (let i = 1; i < poly.length; i++) ctx.lineTo(poly[i][0], poly[i][1]);
-      ctx.closePath();
+      if (isClosed(this.bez)) ctx.closePath();
       ctx.stroke();
       this._anchorPx = this.bez.anchors.map(toPx);
       this._handlePx = null;
       if (this._sel >= 0 && this._sel < this._anchorPx.length) {
         const a = this._anchorPx[this._sel];
-        const out = toPx(this.bez.outHandles[this._sel]);
-        const inp = toPx(this.bez.inHandles[this._sel]);
+        const n = this.bez.anchors.length;
+        const open = !isClosed(this.bez);
+        const out = !(open && this._sel === n - 1) ? toPx(this.bez.outHandles[this._sel]) : null;
+        const inp = !(open && this._sel === 0) ? toPx(this.bez.inHandles[this._sel]) : null;
         this._handlePx = { out, in: inp };
         ctx.strokeStyle = COLOR.handleLine;
         ctx.lineWidth = 1;
         for (const hp of [out, inp]) {
+          if (!hp) continue;
           ctx.beginPath();
           ctx.moveTo(a[0], a[1]);
           ctx.lineTo(hp[0], hp[1]);
@@ -1909,17 +2165,36 @@ var ROIDrawBundle = (() => {
 
   // ui/draw-panel.js
   var DrawPanel = class {
-    constructor({ onExport, onImport, onClear, onRemove, onEdit } = {}) {
+    constructor({ onExport, onExportSulci, onImport, onClear, onRemove, onEdit, onTool } = {}) {
       this.onRemove = onRemove || (() => {
       });
       this.onEdit = onEdit || (() => {
+      });
+      this.onTool = onTool || (() => {
       });
       this._editingId = null;
       const el = document.createElement("div");
       el.className = "roidraw-panel";
       const h = document.createElement("h2");
-      h.textContent = "ROI draw";
+      h.textContent = "Draw ROIs + sulci";
       el.appendChild(h);
+      this.tool = "lasso";
+      const tools = document.createElement("div");
+      tools.className = "roidraw-tools";
+      tools.setAttribute("role", "group");
+      tools.setAttribute("aria-label", "shape kind");
+      this._toolBtns = {};
+      for (const [tool, label] of [["lasso", "ROI"], ["trace", "Sulcus"]]) {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "roidraw-tools__btn";
+        b.textContent = label;
+        b.setAttribute("aria-pressed", String(tool === this.tool));
+        b.onclick = () => this.setTool(tool);
+        this._toolBtns[tool] = b;
+        tools.appendChild(b);
+      }
+      el.appendChild(tools);
       this.statusEl = document.createElement("div");
       this.statusEl.className = "roidraw-status";
       el.appendChild(this.statusEl);
@@ -1935,9 +2210,14 @@ var ROIDrawBundle = (() => {
       el.appendChild(this.listEl);
       const exp = document.createElement("button");
       exp.type = "button";
-      exp.textContent = "Export JSON";
+      exp.textContent = "Export ROIs (JSON)";
       exp.onclick = () => onExport && onExport();
       el.appendChild(exp);
+      const expS = document.createElement("button");
+      expS.type = "button";
+      expS.textContent = "Export sulci (SVG)";
+      expS.onclick = () => onExportSulci && onExportSulci();
+      el.appendChild(expS);
       const lab = document.createElement("label");
       lab.textContent = "Import: ";
       const inp = document.createElement("input");
@@ -1961,11 +2241,26 @@ var ROIDrawBundle = (() => {
       el.appendChild(this.msgEl);
       document.body.appendChild(el);
       this.el = el;
+      this._reflectTool();
       this.renderList([]);
     }
     // The id of the ROI currently being edited (highlighted + its Edit link reads "done"), or null.
     setEditingId(id) {
       this._editingId = id;
+    }
+    /* Paint the segmented control to match this.tool. Fires no callback. */
+    _reflectTool() {
+      for (const [t, b] of Object.entries(this._toolBtns)) {
+        const on = t === this.tool;
+        b.classList.toggle("roidraw-tools__btn--on", on);
+        b.setAttribute("aria-pressed", String(on));
+      }
+    }
+    /* Select the active draw tool, reflect it, and notify the controller. */
+    setTool(tool) {
+      this.tool = tool === "trace" ? "trace" : "lasso";
+      this._reflectTool();
+      this.onTool(this.tool);
     }
     setStatus(text, kind = "ok") {
       this.statusEl.textContent = text;
@@ -1982,44 +2277,51 @@ var ROIDrawBundle = (() => {
       if (this.el && this.el.parentNode) this.el.parentNode.removeChild(this.el);
       this.el = null;
     }
-    renderList(rois) {
-      const ed = rois.find((r) => r.id === this._editingId);
+    renderList(shapes) {
+      const ed = shapes.find((s) => s.id === this._editingId);
       this.doneEl.style.display = ed ? "" : "none";
       if (ed) this.doneEl.textContent = "\u2713 Done editing \u201C" + ed.name + "\u201D";
       const list = this.listEl;
       list.textContent = "";
-      if (!rois.length) {
+      if (!shapes.length) {
         const e = document.createElement("span");
         e.className = "roidraw-list__empty";
-        e.textContent = "no ROIs yet";
+        e.textContent = "nothing drawn yet";
         list.appendChild(e);
         return;
       }
-      for (const r of rois) {
-        const editing = r.id === this._editingId;
+      for (const s of shapes) {
+        const editing = s.id === this._editingId;
+        const sulcus = s.kind === "sulcus";
         const row = document.createElement("div");
         row.className = "roidraw-roi" + (editing ? " roidraw-roi--editing" : "");
         const sw = document.createElement("span");
         sw.className = "roidraw-roi__swatch";
-        sw.style.background = r.color;
+        sw.style.background = s.color;
         row.appendChild(sw);
+        const kd = document.createElement("span");
+        kd.className = "roidraw-roi__kind";
+        kd.textContent = sulcus ? "\u223F" : "\u25EF";
+        kd.title = sulcus ? "sulcus" : "ROI";
+        row.appendChild(kd);
         const nm = document.createElement("span");
         nm.className = "roidraw-roi__name";
-        nm.textContent = r.name;
+        nm.textContent = s.name;
         row.appendChild(nm);
         const ct = document.createElement("span");
         ct.className = "roidraw-roi__count";
-        ct.textContent = String(r.left.length + r.right.length);
+        ct.textContent = sulcus ? String(s.bezier && s.bezier.anchors ? s.bezier.anchors.length : 0) : String(s.left.length + s.right.length);
+        ct.title = sulcus ? "anchors" : "vertices";
         row.appendChild(ct);
         const edit = document.createElement("button");
         edit.type = "button";
         edit.className = "roidraw-roi__editbtn" + (editing ? " roidraw-roi__editbtn--on" : "");
         edit.textContent = editing ? "editing" : "\u270E edit";
-        edit.title = r.bezier ? editing ? "finish editing" : "edit shape" : "no editable curve";
-        edit.disabled = !r.bezier;
+        edit.title = s.bezier ? editing ? "finish editing" : "edit shape" : "no editable curve";
+        edit.disabled = !s.bezier;
         edit.onclick = (e) => {
           e.preventDefault();
-          if (r.bezier) this.onEdit(editing ? null : r.id);
+          if (s.bezier) this.onEdit(editing ? null : s.id);
         };
         row.appendChild(edit);
         const del = document.createElement("button");
@@ -2027,10 +2329,10 @@ var ROIDrawBundle = (() => {
         del.className = "roidraw-roi__del";
         del.textContent = "\u2715";
         del.title = "remove";
-        del.setAttribute("aria-label", "remove " + r.name);
+        del.setAttribute("aria-label", "remove " + (sulcus ? "sulcus " : "ROI ") + s.name);
         del.onclick = (e) => {
           e.preventDefault();
-          this.onRemove(r.id);
+          this.onRemove(s.id);
         };
         row.appendChild(del);
         list.appendChild(row);
@@ -2077,7 +2379,7 @@ var ROIDrawBundle = (() => {
   };
 
   // ui/roidraw.css
-  var roidraw_default = '/* roidraw UI \u2014 class-based styles (no inline style strings in the JS). */\n\n.roidraw-overlay {\n    position: fixed;\n    left: 0;\n    top: 0;\n    pointer-events: none;          /* only captures in draw mode (.roidraw-overlay--active) */\n    z-index: 9998;\n    outline-offset: -2px;\n}\n.roidraw-overlay--active { cursor: crosshair; background: rgba(255, 204, 0, 0.05); outline: 2px dashed rgba(255, 204, 0, 0.8); }\n.roidraw-overlay--inspect { cursor: cell;  background: rgba(80, 160, 255, 0.06); outline: 2px dashed rgba(80, 160, 255, 0.85); }\n.roidraw-edit-overlay--active { outline: 2px dashed rgba(57, 208, 255, 0.85); }\n\n.roidraw-panel {\n    position: fixed;\n    right: 10px;\n    top: 8px;\n    z-index: 9999;\n    width: 230px;\n    padding: 10px;\n    background: rgba(20, 20, 20, 0.92);\n    color: #eee;\n    font: 12px/1.4 -apple-system, system-ui, sans-serif;\n    border: 1px solid #444;\n    border-radius: 6px;\n}\n.roidraw-panel h2 { font-size: 12px; font-weight: 700; margin: 0 0 6px; }\n.roidraw-panel button { width: 100%; margin-bottom: 6px; }\n.roidraw-panel input[type="file"] { width: 100%; }\n.roidraw-panel label { display: block; margin-bottom: 4px; }\n\n.roidraw-status { margin-bottom: 6px; }\n.roidraw-status--ok    { color: #9f9; }\n.roidraw-status--warn  { color: #f99; }\n.roidraw-status--draw  { color: #ffcc00; }\n.roidraw-status--inspect { color: #6cf; }\n\n.roidraw-list { margin-bottom: 6px; }\n.roidraw-list__empty { color: #777; }\n.roidraw-roi { display: flex; align-items: center; gap: 4px; margin: 2px 0; }\n.roidraw-roi__swatch { width: 10px; height: 10px; display: inline-block; border-radius: 2px; }\n.roidraw-roi__name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }\n.roidraw-roi__count { color: #999; }\n.roidraw-roi__editbtn {\n    width: auto;                   /* override .roidraw-panel button { width: 100% } */\n    margin: 0;\n    padding: 3px 9px;\n    font-size: 11px;\n    color: #cdeffb;\n    background: #18586e;\n    border: 1px solid #2c7d99;\n    border-radius: 4px;\n    cursor: pointer;\n}\n.roidraw-roi__editbtn:hover:not(:disabled) { background: #1e6f8a; }\n.roidraw-roi__editbtn--on { background: #1e9fd0; border-color: #4cc6f0; color: #04222e; font-weight: 700; }\n.roidraw-roi__editbtn:disabled { opacity: 0.4; cursor: default; }\n/* a bare \u2715 glyph: strip the default <button> chrome (background/border/padding) so only the \xD7 shows */\n.roidraw-roi__del { color: #f77; background: none; border: none; padding: 0; font: inherit; line-height: 1; cursor: pointer; }\n.roidraw-roi__del:hover { color: #ff9a9a; }\n.roidraw-roi--editing { outline: 1px solid rgba(57, 208, 255, 0.6); border-radius: 3px; }\n\n.roidraw-done {\n    background: #1e9fd0;\n    color: #04222e;\n    font-weight: 700;\n    border: 0;\n    padding: 9px;\n    border-radius: 5px;\n}\n.roidraw-done:hover { background: #36b6e6; }\n\n.roidraw-msg { color: #9cf; font-size: 11px; max-height: 110px; overflow: auto; word-break: break-word; }\n\n.roidraw-modebar {\n    position: fixed;\n    right: 264px;                  /* refined to sit left of the control panel at runtime */\n    top: 8px;\n    z-index: 10001;\n    display: flex;\n    border-radius: 6px;\n    overflow: hidden;\n    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);\n    font: 600 12px -apple-system, system-ui, sans-serif;\n}\n.roidraw-modebtn { border: 0; padding: 7px 16px; cursor: pointer; color: #eee; background: #333; }\n.roidraw-modebtn--active { background: #1a7f37; }\n';
+  var roidraw_default = '/* roidraw UI \u2014 class-based styles (no inline style strings in the JS). */\n\n.roidraw-overlay {\n    position: fixed;\n    left: 0;\n    top: 0;\n    pointer-events: none;          /* only captures in draw mode (.roidraw-overlay--active) */\n    z-index: 9998;\n    outline-offset: -2px;\n}\n.roidraw-overlay--active { cursor: crosshair; background: rgba(255, 204, 0, 0.05); outline: 2px dashed rgba(255, 204, 0, 0.8); }\n.roidraw-overlay--inspect { cursor: cell;  background: rgba(80, 160, 255, 0.06); outline: 2px dashed rgba(80, 160, 255, 0.85); }\n.roidraw-edit-overlay--active { outline: 2px dashed rgba(57, 208, 255, 0.85); }\n\n.roidraw-panel {\n    position: fixed;\n    right: 10px;\n    top: 8px;\n    z-index: 9999;\n    width: 230px;\n    padding: 10px;\n    background: rgba(20, 20, 20, 0.92);\n    color: #eee;\n    font: 12px/1.4 -apple-system, system-ui, sans-serif;\n    border: 1px solid #444;\n    border-radius: 6px;\n}\n.roidraw-panel h2 { font-size: 12px; font-weight: 700; margin: 0 0 6px; }\n.roidraw-panel button { width: 100%; margin-bottom: 6px; }\n.roidraw-panel input[type="file"] { width: 100%; }\n.roidraw-panel label { display: block; margin-bottom: 4px; }\n\n.roidraw-status { margin-bottom: 6px; }\n.roidraw-status--ok    { color: #9f9; }\n.roidraw-status--warn  { color: #f99; }\n.roidraw-status--draw  { color: #ffcc00; }\n.roidraw-status--inspect { color: #6cf; }\n\n.roidraw-tools { display: flex; gap: 0; margin: 6px 0 8px; }\n/* `.roidraw-panel button` is (0,1,1); a bare `.roidraw-tools__btn` is (0,1,0) and loses to it, so\n * the width/margin resets below must be scoped under .roidraw-panel to actually take effect. */\n.roidraw-panel .roidraw-tools__btn {\n    flex: 1;\n    width: auto;                   /* override .roidraw-panel button { width: 100% } */\n    margin: 0;                     /* override .roidraw-panel button { margin-bottom: 6px } */\n    padding: 5px 8px; font: inherit; cursor: pointer;\n    background: #2a2a2a; color: #ddd; border: 1px solid #444;\n}\n/* All scoped under .roidraw-panel too: a bare selector here would lose to the base rule above. */\n.roidraw-panel .roidraw-tools__btn:first-child { border-radius: 3px 0 0 3px; }\n.roidraw-panel .roidraw-tools__btn:last-child { border-radius: 0 3px 3px 0; border-left: none; }\n.roidraw-panel .roidraw-tools__btn--on { background: #ffcc00; color: #111; border-color: #ffcc00; }\n\n.roidraw-list { margin-bottom: 6px; }\n.roidraw-list__empty { color: #777; }\n.roidraw-roi { display: flex; align-items: center; gap: 4px; margin: 2px 0; }\n.roidraw-roi__swatch { width: 10px; height: 10px; display: inline-block; border-radius: 2px; }\n.roidraw-roi__kind { width: 1.2em; text-align: center; opacity: 0.75; }\n.roidraw-roi__name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }\n.roidraw-roi__count { color: #999; }\n.roidraw-roi__editbtn {\n    width: auto;                   /* override .roidraw-panel button { width: 100% } */\n    margin: 0;\n    padding: 3px 9px;\n    font-size: 11px;\n    color: #cdeffb;\n    background: #18586e;\n    border: 1px solid #2c7d99;\n    border-radius: 4px;\n    cursor: pointer;\n}\n.roidraw-roi__editbtn:hover:not(:disabled) { background: #1e6f8a; }\n.roidraw-roi__editbtn--on { background: #1e9fd0; border-color: #4cc6f0; color: #04222e; font-weight: 700; }\n.roidraw-roi__editbtn:disabled { opacity: 0.4; cursor: default; }\n/* a bare \u2715 glyph: strip the default <button> chrome (background/border/padding) so only the \xD7 shows */\n.roidraw-roi__del { color: #f77; background: none; border: none; padding: 0; font: inherit; line-height: 1; cursor: pointer; }\n.roidraw-roi__del:hover { color: #ff9a9a; }\n.roidraw-roi--editing { outline: 1px solid rgba(57, 208, 255, 0.6); border-radius: 3px; }\n\n.roidraw-done {\n    background: #1e9fd0;\n    color: #04222e;\n    font-weight: 700;\n    border: 0;\n    padding: 9px;\n    border-radius: 5px;\n}\n.roidraw-done:hover { background: #36b6e6; }\n\n.roidraw-msg { color: #9cf; font-size: 11px; max-height: 110px; overflow: auto; word-break: break-word; }\n\n.roidraw-modebar {\n    position: fixed;\n    right: 264px;                  /* refined to sit left of the control panel at runtime */\n    top: 8px;\n    z-index: 10001;\n    display: flex;\n    border-radius: 6px;\n    overflow: hidden;\n    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);\n    font: 600 12px -apple-system, system-ui, sans-serif;\n}\n.roidraw-modebtn { border: 0; padding: 7px 16px; cursor: pointer; color: #eee; background: #333; }\n.roidraw-modebtn--active { background: #1a7f37; }\n';
 
   // index.js
   var LAYER = "drawnrois";
@@ -2094,10 +2396,11 @@ var ROIDrawBundle = (() => {
     constructor(viewer, opts = {}) {
       injectCss();
       this.adapter = new PycortexAdapter(viewer, opts);
-      this.rois = new ROISet();
+      this.shapes = new ShapeSet();
       this._dm = new DrawModeMachine();
       this.overlay = new LassoOverlay(this.adapter, {
         onLasso: (pts) => this._finishLasso(pts),
+        onTrace: (pts) => this._finishTrace(pts),
         onInspect: (x, y) => this.adapter.inspectAt(x, y)
       });
       this.editOverlay = new BezierEditOverlay(this.adapter, {
@@ -2106,10 +2409,12 @@ var ROIDrawBundle = (() => {
       this.editingId = null;
       this.panel = new DrawPanel({
         onExport: () => this.exportJSON(),
+        onExportSulci: () => this.exportSulciSVG(),
         onImport: (file) => this._import(file),
         onClear: () => this.clear(),
         onRemove: (id) => this.remove(id),
-        onEdit: (id) => this._editToggle(id)
+        onEdit: (id) => this._editToggle(id),
+        onTool: (tool) => this._setTool(tool)
       });
       this.toggle = new ModeToggle({ onMode: (m) => this.setMode(m) });
       this._unsubMix = this.adapter.onMixChange(() => this._onMix());
@@ -2173,6 +2478,13 @@ var ROIDrawBundle = (() => {
     _updateDrawActive() {
       this.overlay.setActive(this._dm.lassoActive(this.adapter.isFlat(), this.editOverlay.isEditing()));
     }
+    // Which gesture a plain drag performs. Ending an in-flight edit first: the edit overlay owns
+    // the pointer while it is up, and the new tool's stroke would be swallowed by it.
+    _setTool(tool) {
+      if (this.editOverlay.isEditing()) this._editToggle(null);
+      this.overlay.setTool(tool);
+      this._renderStatus();
+    }
     _renderStatus() {
       if (this.mode !== "draw") return;
       if (!this.adapter.isFlat()) {
@@ -2180,7 +2492,8 @@ var ROIDrawBundle = (() => {
         return;
       }
       if (this.editOverlay.isEditing()) this.panel.setStatus("Editing \u2014 drag \u25CF to move \xB7 click an anchor, drag \u25CB to bend \xB7 double-click the line to add a point \xB7 double-click \u25CF to toggle corner/smooth \xB7 select + Delete to remove \xB7 scroll to zoom \xB7 \u2713 done when finished.", "draw");
-      else this.panel.setStatus("Lasso to draw \xB7 \u270E to edit a shape \xB7 scroll to zoom \xB7 Shift+drag to pan \xB7 Shift+click to inspect.", "draw");
+      else if (this.overlay.tool === "trace") this.panel.setStatus("Drag along the sulcus \xB7 \u270E to edit a curve \xB7 scroll to zoom \xB7 Shift+drag to pan \xB7 Shift+click to inspect.", "draw");
+      else this.panel.setStatus("Lasso to draw an ROI \xB7 \u270E to edit a shape \xB7 scroll to zoom \xB7 Shift+drag to pan \xB7 Shift+click to inspect.", "draw");
     }
     // --- drawing pipeline -------------------------------------------------------------
     _finishLasso(pts) {
@@ -2189,11 +2502,12 @@ var ROIDrawBundle = (() => {
         this.panel.message("0 vertices selected \u2014 lasso the flatmap.");
         return;
       }
-      const fallback = "roi" + (this.rois.length + 1);
+      const fallback = "roi" + (this.shapes.byKind("roi").length + 1);
       const entered = window.prompt("ROI name:", fallback);
       if (entered === null) return;
       const name = entered.trim() || fallback;
-      this.rois.add({
+      this.shapes.add({
+        kind: "roi",
         name,
         left: sel.left,
         right: sel.right,
@@ -2204,65 +2518,74 @@ var ROIDrawBundle = (() => {
       this._sync();
       this.panel.message('ROI "' + name + '": ' + sel.total + " vertices." + (sel.bezier ? " \u270E editable." : ""));
     }
+    _finishTrace(pts) {
+      const curve = curveFromTrace(this.adapter, pts);
+      if (!curve) {
+        this.panel.message("Couldn't fit a curve \u2014 trace a longer stroke on the flatmap.");
+        return;
+      }
+      const fallback = "sulcus" + (this.shapes.byKind("sulcus").length + 1);
+      const entered = window.prompt("Sulcus name (reuse a name for the other hemisphere):", fallback);
+      if (entered === null) return;
+      const name = entered.trim() || fallback;
+      this.shapes.add({ kind: "sulcus", name, bezier: curve.bezier, labelVert: curve.labelVert });
+      this._sync();
+      this.panel.message('Sulcus "' + name + '": ' + curve.bezier.anchors.length + " anchors. \u270E editable.");
+    }
     // --- editing ----------------------------------------------------------------------
     // Toggle shape editing. id => start editing that ROI's bezier; null => stop.
     _editToggle(id) {
-      const roi = id != null ? this.rois.rois.find((r) => r.id === id) : null;
+      const roi = id != null ? this.shapes.shapes.find((r) => r.id === id) : null;
       if (roi && this._dm.noteEditStart(this.adapter.isFlat()).flatten) this.adapter.flatten();
       this.editingId = roi ? roi.id : null;
       this.editOverlay.setEditing(roi || null);
       this.panel.setEditingId(this.editingId);
       this._updateDrawActive();
-      this.panel.renderList(this.rois.rois);
+      this.panel.renderList(this.shapes.shapes);
       this._renderStatus();
     }
-    // A drag-release from the edit overlay: store the new bezier and re-derive vertices from it.
+    // A drag-release from the edit overlay: store the new bezier. For an ROI, re-derive its vertex
+    // membership from the curve (the bezier is the source of truth). A sulcus HAS no membership.
     _applyEdit(bezier) {
-      const roi = this.rois.rois.find((r) => r.id === this.editingId);
-      if (!roi) return;
-      roi.bezier = bezier;
-      const d = roiFromBezier(this.adapter, bezier);
-      if (d && d.total) {
-        roi.left = d.left;
-        roi.right = d.right;
-        roi.outline = d.outline;
-        roi.labelVert = d.labelVert;
+      const shape = this.shapes.shapes.find((s) => s.id === this.editingId);
+      if (!shape) return;
+      shape.bezier = bezier;
+      if (shape.kind === "roi") {
+        const d = roiFromBezier(this.adapter, bezier);
+        if (d && d.total) {
+          shape.left = d.left;
+          shape.right = d.right;
+          shape.outline = d.outline;
+          shape.labelVert = d.labelVert;
+        }
+      } else {
+        const lv = labelForCurve(this.adapter, bezier);
+        if (lv) shape.labelVert = lv;
       }
-      this.adapter.setOverlayLayer(LAYER, this.rois.rois);
-      this.panel.renderList(this.rois.rois);
+      this.adapter.setOverlayLayer(LAYER, this.shapes.shapes);
+      this.panel.renderList(this.shapes.shapes);
     }
     _sync() {
-      this.adapter.setOverlayLayer(LAYER, this.rois.rois);
-      this.panel.renderList(this.rois.rois);
+      this.adapter.setOverlayLayer(LAYER, this.shapes.shapes);
+      this.panel.renderList(this.shapes.shapes);
     }
     remove(id) {
       if (id === this.editingId) this._editToggle(null);
-      this.rois.remove(id);
+      this.shapes.remove(id);
       this._sync();
     }
     clear() {
       this._editToggle(null);
-      this.rois.clear();
+      this.shapes.clear();
       this._sync();
     }
     // --- export / import --------------------------------------------------------------
-    exportJSON() {
-      if (!this.rois.length) {
-        this.panel.message("Nothing to export.");
-        return;
-      }
-      let text;
-      try {
-        text = JSON.stringify(this.rois.toJSON(this.adapter.surfaceId()), null, 2);
-      } catch (e) {
-        this.panel.message("Export failed: " + (e && e.message ? e.message : e));
-        return;
-      }
-      const blob = new Blob([text], { type: "application/json" });
+    _download(text, filename, mime) {
+      const blob = new Blob([text], { type: mime });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = "rois.json";
+      a.download = filename;
       a.style.display = "none";
       document.body.appendChild(a);
       a.click();
@@ -2270,7 +2593,44 @@ var ROIDrawBundle = (() => {
         a.remove();
         URL.revokeObjectURL(url);
       }, 4e3);
-      this.panel.message("Exported " + this.rois.length + " ROI(s), " + text.length + " bytes, to rois.json.");
+    }
+    exportJSON() {
+      const rois = this.shapes.byKind("roi");
+      if (!rois.length) {
+        this.panel.message("No ROIs to export.");
+        return;
+      }
+      let text;
+      try {
+        text = JSON.stringify(this.shapes.toJSON(this.adapter.surfaceId()), null, 2);
+      } catch (e) {
+        this.panel.message("Export failed: " + (e && e.message ? e.message : e));
+        return;
+      }
+      this._download(text, "rois.json", "application/json");
+      this.panel.message("Exported " + rois.length + " ROI(s), " + text.length + " bytes, to rois.json.");
+    }
+    /* Sulci export as pycortex's OWN overlays.svg markup, not as a roidraw JSON format: paste or
+     * merge the fragment into the subject's overlays.svg and quickflat/WebGL/Inkscape read it. */
+    exportSulciSVG() {
+      const sulci = this.shapes.byKind("sulcus");
+      if (!sulci.length) {
+        this.panel.message("No sulci to export.");
+        return;
+      }
+      let xml;
+      try {
+        xml = this.adapter.exportSulciMarkup(sulci);
+      } catch (e) {
+        this.panel.message("Export failed: " + (e && e.message ? e.message : e));
+        return;
+      }
+      if (!xml) {
+        this.panel.message("Export failed: the SVG overlay isn't loaded yet.");
+        return;
+      }
+      this._download(xml, "sulci.svg", "image/svg+xml");
+      this.panel.message("Exported " + sulci.length + " sulcus curve(s), " + xml.length + " bytes, to sulci.svg.");
     }
     _import(file) {
       const reader = new FileReader();
@@ -2281,7 +2641,7 @@ var ROIDrawBundle = (() => {
             this.panel.message("Import failed: \u201C" + file.name + "\u201D is empty (0 bytes). Re-export and try again.");
             return;
           }
-          const added = this.rois.loadJSON(JSON.parse(text));
+          const added = this.shapes.loadJSON(JSON.parse(text));
           let fitted = 0;
           for (const roi of added) {
             if (!roi.labelVert && roi.outline) {

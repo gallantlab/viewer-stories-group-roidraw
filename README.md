@@ -1,8 +1,9 @@
 # viewer-stories-group-roidraw
 
-A brain viewer of the **gallantlab group semantic maps**, with **in-browser ROI drawing** added —
-an optional companion to the standard viewer. Same data and maps, plus the ability to lasso regions
-on the flattened cortex, name them, and export/import them as portable vertex sets.
+A brain viewer of the **gallantlab group semantic maps**, with **in-browser ROI and sulcus
+drawing** added — an optional companion to the standard viewer. Same data and maps, plus the
+ability to draw on the flattened cortex: lasso regions and export them as portable vertex sets, or
+trace sulci and export them as pycortex `overlays.svg` markup.
 
 ### ▶ Open it: **https://gallantlab.org/viewer-stories-group-roidraw/**
 
@@ -16,19 +17,31 @@ on the flattened cortex, name them, and export/import them as portable vertex se
 Use the **Display / Draw** toggle at the top:
 
 - **Display** — the normal viewer + control panel.
-- **Draw** — the brain flattens and an ROI panel appears, then:
+- **Draw** — the brain flattens and the draw panel appears. An **`ROI` / `Sulcus`** selector at the
+  top of the panel picks what a plain drag draws:
 
 | Gesture | Action |
 | --- | --- |
-| Drag | Lasso a region → name it → it's drawn onto the surface |
+| Drag, with **ROI** selected | Lasso a region → name it → drawn onto the surface as a closed outline |
+| Drag, with **Sulcus** selected | Trace along a sulcus → name it → drawn as an open curve |
 | Scroll | Zoom (to draw fine detail) |
 | **Shift** + drag | Pan |
 | **Shift** + click | Inspect the data under the cursor |
-| `Esc` | Cancel the current lasso |
+| `Esc` | Cancel the current stroke |
 
-The panel has **Export JSON** / **Import** / **Clear all**, and drawn ROIs are a toggleable overlay
-layer alongside the built-in rois/sulci. Exported JSON is portable vertex indices, so an ROI
-re-imports to the exact same outline in any viewer on the same surface.
+Click **✎ edit** on any shape to reshape its bezier — drag anchors and tangent handles, double-click
+the curve to insert a point. Everything drawn is a toggleable overlay layer alongside the built-in
+rois/sulci.
+
+### Two shapes, two export formats
+
+- **ROIs** are closed curves. **Export ROIs (JSON)** writes portable per-hemisphere vertex indices,
+  so an ROI re-imports to the exact same outline in any viewer on the same surface.
+- **Sulci** are open curves. **Export sulci (SVG)** writes an `overlays.svg`-compatible fragment —
+  pycortex's own storage format for sulci — which `quickflat`, the WebGL viewer, and Inkscape read
+  natively. Trace a sulcus on each hemisphere and give both strokes the same name; they merge into a
+  single group with one path per hemisphere, exactly as pycortex stores a sulcus such as `CaS`.
+  Sulci carry no vertex data, because pycortex stores none.
 
 ## Running it locally
 
@@ -46,8 +59,12 @@ Serve it over HTTP; opening `viewer.html` directly as a `file://` path won't loa
 The standard viewer's assets (surface, data, overlays) are untouched. ROI drawing was added by
 injecting a self-contained bundle (`roidraw.bundle.js`) plus two `<script>` tags into `viewer.html`,
 and by applying small fixups to two long-standing pycortex help-menu bugs (shortcut-key casing, and
-centering the `h` help panel). The drawing tool itself is the reusable `pycortex-roidraw` library (a
-private gallantlab repo) and can be dropped into any pycortex viewer.
+centering the `h` help panel). The drawing tool itself is the reusable
+[`pycortex-roidraw`](https://github.com/gallantlab/pycortex-roidraw) library and can be dropped into
+any pycortex viewer.
+
+This build is baked with **pycortex-roidraw v0.4.0**. The bundle is a pinned copy, not a live link
+to `releases/latest`, so it must be re-baked when roidraw changes.
 
 ---
 
