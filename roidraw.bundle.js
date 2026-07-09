@@ -84,6 +84,8 @@ var ROIDrawBundle = (() => {
      * (`outline`) used as a fallback for files predating the bezier.
      * @param {string} name
      * @param {Array<{kind, name, color?, outline?:[{h,g}], labelVert:{h,g}, bezier?}>} shapes
+     * @returns {boolean} false if the host's overlay machinery isn't ready yet (the caller retries);
+     *   true once the layer is in place. Never silently drop shapes — they'd be listed but undrawn.
      */
     setOverlayLayer(_name, _shapes) {
       throw new Error("ViewerAdapter.setOverlayLayer not implemented");
@@ -137,6 +139,9 @@ var ROIDrawBundle = (() => {
     }
     /** Show/hide the host's control panel when switching Display/Draw modes. */
     setControlPanelVisible(_visible) {
+    }
+    /** Release any host listeners/timers the adapter installed. Called by ROIDrawer.destroy(). */
+    destroy() {
     }
   };
   ViewerAdapter.REQUIRED = [
@@ -253,7 +258,7 @@ var ROIDrawBundle = (() => {
   // core/bezier.js
   var UV_RDP_EPSILON = 4e-3;
   function isClosed(bez) {
-    return !bez || bez.closed !== false;
+    return !!bez && bez.closed !== false;
   }
   function segCount(bez) {
     const n = bez && bez.anchors ? bez.anchors.length : 0;
@@ -387,6 +392,7 @@ var ROIDrawBundle = (() => {
     };
   }
   var inRange = (bez, i) => Number.isInteger(i) && i >= 0 && i < bez.anchors.length;
+  var segInRange = (bez, seg) => Number.isInteger(seg) && seg >= 0 && seg < segCount(bez);
   function moveAnchor(bez, i, pos) {
     const b = cloneBezier(bez);
     if (!inRange(b, i)) return b;
@@ -408,6 +414,7 @@ var ROIDrawBundle = (() => {
   }
   function setAnchorSmooth(bez, i, smooth) {
     const b = cloneBezier(bez);
+    if (!inRange(b, i)) return b;
     const n = b.anchors.length;
     const endpoint = !isClosed(b) && (i === 0 || i === n - 1);
     b.smooth[i] = endpoint ? false : !!smooth;
@@ -432,6 +439,7 @@ var ROIDrawBundle = (() => {
   }
   function splitSegment(bez, seg, t) {
     const b = cloneBezier(bez);
+    if (!segInRange(b, seg)) return b;
     const n = b.anchors.length;
     const j = isClosed(b) ? (seg + 1) % n : seg + 1;
     const p0 = b.anchors[seg], p1 = b.outHandles[seg], p2 = b.inHandles[j], p3 = b.anchors[j];
@@ -458,6 +466,7 @@ var ROIDrawBundle = (() => {
     const floor = isClosed(bez) ? 3 : 2;
     if (bez.anchors.length <= floor) return bez;
     const b = cloneBezier(bez);
+    if (!inRange(b, i)) return b;
     b.anchors.splice(i, 1);
     b.inHandles.splice(i, 1);
     b.outHandles.splice(i, 1);
@@ -499,48 +508,60 @@ var ROIDrawBundle = (() => {
   }
 
   // core/svg-export.js
-  var SULCI_PATH_STYLE = "fill:none;stroke:white;stroke-width:6;stroke-opacity:0.6;stroke-linecap:round";
-  var LABEL_STYLE = "font-family:Helvetica, sans-serif;font-size:14pt;font-style:italic;fill:white;fill-opacity:1;text-anchor:middle";
+  var SULCI_STROKE_WIDTH = 6;
+  var SULCI_STROKE_OPACITY = 0.6;
+  var SULCI_PATH_STYLE = `fill:none;stroke:white;stroke-width:${SULCI_STROKE_WIDTH};stroke-opacity:${SULCI_STROKE_OPACITY};stroke-linecap:round`;
+  var SVGNS = "http://www.w3.org/2000/svg";
+  var INKNS = "http://www.inkscape.org/namespaces/inkscape";
+  var MERGE_HELP = ` Drawn with pycortex-roidraw. To install these sulci into a subject's overlays.svg, copy the
+     <g inkscape:label="\u2026"> children of #sulci_shapes below into that file's EXISTING
+     #sulci_shapes group. Do NOT paste the whole <g id="sulci"> layer: a second layer with
+     inkscape:label="sulci" silently replaces the subject's own in SVGOverlay.layers.
+     Leave #sulci_labels empty \u2014 pycortex derives sulcus labels from the path geometry. `;
   function escapeXml(s) {
     return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
   }
-  function exportSulciSvg(sulci, { pathFor, ptidxFor }) {
+  function xmlComment(text) {
+    return "<!--" + text.replace(/-{2,}/g, "-").replace(/-$/, "- ") + "-->";
+  }
+  function exportSulciSvg(sulci, { pathFor, width, height }) {
     if (!sulci || !sulci.length) return "";
     const groups = /* @__PURE__ */ new Map();
     for (const s of sulci) {
-      if (!groups.has(s.name)) groups.set(s.name, { name: s.name, ds: [], labelVert: null });
-      const g = groups.get(s.name);
+      if (!groups.has(s.name)) groups.set(s.name, []);
       const d = pathFor(s.bezier);
-      if (d) g.ds.push(d);
-      if (!g.labelVert && s.labelVert) g.labelVert = s.labelVert;
+      if (d) groups.get(s.name).push(d);
     }
-    const shapes = [], labels = [];
-    for (const g of groups.values()) {
-      if (!g.ds.length) continue;
-      const name = escapeXml(g.name);
-      const paths = g.ds.map((d) => `        <path style="${SULCI_PATH_STYLE}" d="${escapeXml(d)}" />`);
-      shapes.push(`      <g inkscape:groupmode="layer" inkscape:label="${name}">
+    const shapes = [];
+    for (const [name, ds] of groups) {
+      if (!ds.length) continue;
+      const label = escapeXml(name);
+      const paths = ds.map((d) => `        <path style="${SULCI_PATH_STYLE}" d="${escapeXml(d)}" />`);
+      shapes.push(`      <g inkscape:groupmode="layer" inkscape:label="${label}">
 ${paths.join("\n")}
       </g>`);
-      const ptidx = g.labelVert ? ptidxFor(g.labelVert) : null;
-      if (ptidx != null) labels.push(`      <text data-ptidx="${ptidx}" style="${LABEL_STYLE}">${name}</text>`);
     }
     if (!shapes.length) return "";
+    const size = width > 0 && height > 0 ? ` width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"` : "";
     return [
-      '<g inkscape:groupmode="layer" id="sulci" inkscape:label="sulci" style="display:inline">',
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      `<svg xmlns="${SVGNS}" xmlns:inkscape="${INKNS}" version="1.1"${size}>`,
+      "  " + xmlComment(MERGE_HELP),
+      '  <g inkscape:groupmode="layer" id="sulci" inkscape:label="sulci" style="display:inline">',
       '    <g inkscape:groupmode="layer" id="sulci_shapes" inkscape:label="shapes">',
       shapes.join("\n"),
       "    </g>",
-      '    <g inkscape:groupmode="layer" id="sulci_labels" inkscape:label="labels">',
-      labels.join("\n"),
-      "    </g>",
-      "</g>",
+      // Mandatory but EMPTY: _find_layer(layer, "labels") raises without it, and pycortex fills
+      // it from the path geometry. Any <text> we wrote here would crash Labels.__init__.
+      '    <g inkscape:groupmode="layer" id="sulci_labels" inkscape:label="labels" />',
+      "  </g>",
+      "</svg>",
       ""
     ].join("\n");
   }
 
   // adapter/pycortex-adapter.js
-  var SVGNS = "http://www.w3.org/2000/svg";
+  var SVGNS2 = "http://www.w3.org/2000/svg";
   var HEMIS = ["left", "right"];
   var FLAT_THRESHOLD = 0.999;
   var DEFAULT_FILL = 0.7;
@@ -558,8 +579,8 @@ ${paths.join("\n")}
   var OUTLINE_HALO_PX = 2;
   var OUTLINE_FALLBACK_COLOR = "#ffffff";
   var LABEL_FONT_PT = 14;
-  var CURVE_STROKE_PX = 6;
-  var CURVE_STROKE_OPACITY = 0.6;
+  var CURVE_STROKE_PX = SULCI_STROKE_WIDTH;
+  var CURVE_STROKE_OPACITY = SULCI_STROKE_OPACITY;
   function safeColor(c) {
     return typeof c === "string" && /^#[0-9a-fA-F]{3,8}$/.test(c) ? c : OUTLINE_FALLBACK_COLOR;
   }
@@ -624,6 +645,8 @@ ${paths.join("\n")}
       this._layerHidden = false;
       this._labelsHidden = false;
       this._uiFolderAdded = false;
+      this._timers = /* @__PURE__ */ new Set();
+      this._onSetData = null;
     }
     // --- surface identity -------------------------------------------------------------
     surfaceId() {
@@ -923,6 +946,7 @@ ${paths.join("\n")}
           if (this._drawn.layerEl && this._drawn.layerEl.parentNode)
             this._drawn.layerEl.parentNode.removeChild(this._drawn.layerEl);
         } catch (e) {
+          console.warn("[roidraw] tearing down the previous overlay layer failed:", e);
         }
         delete svgo.layers[name];
         delete svgo[name];
@@ -932,13 +956,13 @@ ${paths.join("\n")}
         svgo.update();
         return true;
       }
-      const layerEl = doc.createElementNS(SVGNS, "g");
+      const layerEl = doc.createElementNS(SVGNS2, "g");
       layerEl.setAttribute("id", name);
       layerEl.setAttribute("class", "display_layer");
       layerEl.setAttribute("style", "display:" + (this._layerHidden ? "none" : "inline"));
-      const shapesEl = doc.createElementNS(SVGNS, "g");
+      const shapesEl = doc.createElementNS(SVGNS2, "g");
       shapesEl.setAttribute("id", name + "_shapes");
-      const labelsEl = doc.createElementNS(SVGNS, "g");
+      const labelsEl = doc.createElementNS(SVGNS2, "g");
       labelsEl.setAttribute("id", name + "_labels");
       layerEl.appendChild(shapesEl);
       layerEl.appendChild(labelsEl);
@@ -948,18 +972,18 @@ ${paths.join("\n")}
           const sulcus = shape.kind === "sulcus";
           const w = sulcus ? CURVE_STROKE_PX : OUTLINE_STROKE_PX;
           const op = sulcus ? CURVE_STROKE_OPACITY : 1;
-          const halo = doc.createElementNS(SVGNS, "path");
+          const halo = doc.createElementNS(SVGNS2, "path");
           halo.setAttribute("d", d);
           halo.setAttribute("style", "fill:none;stroke:#ffffff;stroke-width:" + (w + OUTLINE_HALO_PX) + ";stroke-opacity:0.9");
           shapesEl.appendChild(halo);
-          const path = doc.createElementNS(SVGNS, "path");
+          const path = doc.createElementNS(SVGNS2, "path");
           path.setAttribute("d", d);
           path.setAttribute("style", "fill:none;stroke:" + safeColor(shape.color) + ";stroke-width:" + w + ";stroke-opacity:" + op);
           shapesEl.appendChild(path);
         }
         const ptidx = this._labelPtidx(shape.labelVert);
         if (ptidx != null) {
-          const t = doc.createElementNS(SVGNS, "text");
+          const t = doc.createElementNS(SVGNS2, "text");
           t.setAttribute("data-ptidx", String(ptidx));
           t.setAttribute("style", "font-family:Helvetica, sans-serif;font-size:" + LABEL_FONT_PT + "pt;font-weight:bold;font-style:italic;fill:white;fill-opacity:1;text-anchor:middle;filter:url(#dropshadow)");
           t.appendChild(doc.createTextNode(shape.name));
@@ -1041,20 +1065,31 @@ ${paths.join("\n")}
       return closed ? d + "Z" : d;
     }
     /*
-     * Serialize drawn sulci as a pycortex overlays.svg fragment. The `d` strings come from the
-     * SAME uv->viewBox mapping the live overlay uses, which is pycortex's own overlay coordinate
-     * space — so the output drops straight into a subject's overlays.svg. Returns "" if the
-     * overlay isn't loaded yet or there are no sulci.
+     * Serialize drawn sulci as a standalone SVG whose `sulci` layer drops straight into a
+     * subject's overlays.svg. The `d` strings come from the SAME uv->viewBox mapping the live
+     * overlay uses, which is pycortex's own overlay coordinate space.
+     *
+     * Returns null when the SVG overlay hasn't loaded (so we don't know the coordinate space),
+     * and "" when it has loaded but no sulcus yielded a path. The caller must tell those apart:
+     * they are different failures with different fixes.
      */
     exportSulciMarkup(sulci) {
       const svgo = this.surface.svg;
-      if (!svgo || !svgo.svg) return "";
+      if (!svgo || !svgo.svg) return null;
       const { W, H } = this._overlayDims(svgo);
       return exportSulciSvg(sulci, {
         pathFor: (bez) => bez ? this._bezierSvgPath(bez, W, H) : null,
-        ptidxFor: (lv) => this._labelPtidx(lv)
+        width: W,
+        height: H
       });
     }
+    /*
+     * The WebGL viewer's label convention: a flat vertex index, right-hemisphere indices offset by
+     * the left hemisphere's vertex count. BROWSER-ONLY. `svgoverlay.js`'s Labels reads `data-ptidx`
+     * off a <text> to place it; the Python side does the reverse (`SVGOverlay.set_coords` computes
+     * `data-ptidx` from the label's x/y). So this value must never be written into exported markup
+     * — see core/svg-export.js. It is used solely for the live, in-viewer overlay layer.
+     */
     _labelPtidx(lv) {
       if (!lv) return null;
       const leftlen = attrCount(this.posdata.left.positions[0]);
@@ -1110,12 +1145,15 @@ ${paths.join("\n")}
     }
     // pycortex-specific startup niceties (not part of the portable contract):
     // hide the built-in ROI layer (keep sulci), and re-collapse the late "data layers" folder.
+    // Every timer and listener started here is tracked so destroy() can undo it: autoAttach
+    // destroys a prior drawer before attaching a new one, and an orphaned retry chain would keep
+    // poking a dead viewer for seconds afterwards.
     applyHostDefaults() {
       const trySetOverlays = (tries) => {
         const svg = this.surface && this.surface.svg;
         if (!svg || !svg.layers || !(svg.rois || svg.sulci)) {
           if (tries > OVERLAY_RETRY_MAX) return;
-          setTimeout(() => trySetOverlays(tries + 1), OVERLAY_RETRY_MS);
+          this._later(() => trySetOverlays(tries + 1), OVERLAY_RETRY_MS);
           return;
         }
         if (svg.rois) {
@@ -1126,12 +1164,32 @@ ${paths.join("\n")}
         this.requestRender();
       };
       trySetOverlays(0);
-      COLLAPSE_SCHEDULE_MS.forEach((ms) => setTimeout(() => this.collapseControlPanel(false), ms));
+      COLLAPSE_SCHEDULE_MS.forEach((ms) => this._later(() => this.collapseControlPanel(false), ms));
       const t0 = Date.now();
-      if (this.viewer.addEventListener)
-        this.viewer.addEventListener("setData", () => {
+      if (this.viewer.addEventListener) {
+        this._onSetData = () => {
           if (Date.now() - t0 < COLLAPSE_WINDOW_MS) this.collapseControlPanel(false);
-        });
+        };
+        this.viewer.addEventListener("setData", this._onSetData);
+      }
+    }
+    /* setTimeout, remembered, so destroy() can cancel it. */
+    _later(fn, ms) {
+      const id = setTimeout(() => {
+        this._timers.delete(id);
+        fn();
+      }, ms);
+      this._timers.add(id);
+      return id;
+    }
+    // Release everything applyHostDefaults() started. The overlay layer itself is left in place:
+    // the controller clears it (setOverlayLayer(name, [])) before it tears the adapter down.
+    destroy() {
+      for (const id of this._timers) clearTimeout(id);
+      this._timers.clear();
+      if (this._onSetData && this.viewer.removeEventListener)
+        this.viewer.removeEventListener("setData", this._onSetData);
+      this._onSetData = null;
     }
     // Rebuild posdata from hemi attributes if the picker's isn't available (mirrors pycortex).
     _buildPosdata() {
@@ -1175,7 +1233,7 @@ ${paths.join("\n")}
     /* An ROI carries membership (left/right/outline); a sulcus carries only its open bezier and a
      * label vertex. Vertex fields are omitted entirely for sulci rather than set to empty arrays,
      * so a downstream reader can't mistake "no membership" for "membership of nothing". */
-    add({ kind = "roi", name, color, left, right, outline = null, labelVert = null, bezier = null }) {
+    add({ kind = "roi", name, color, left = [], right = [], outline = null, labelVert = null, bezier = null }) {
       const shape = { id: this.nextId++, kind, name, color: color || this.nextColor(), labelVert, bezier };
       if (kind === "roi") {
         shape.left = left;
@@ -1212,9 +1270,10 @@ ${paths.join("\n")}
     }
     /* Append ROIs from a parsed document. A vertexset document only ever holds ROIs, so every
      * entry is tagged kind:"roi". Returns the shapes added. Throws on an unknown format.
-     * Purely structural: arrays are defensively copied so the model never aliases the caller's
-     * parsed JSON, and a missing labelVert is left null (the viewer back-fills it from geometry —
-     * see draw-pipeline.backfillLabel — so reloaded ROIs label the same way freshly drawn ones do). */
+     * Purely structural, and DEEPLY copied: the model never aliases the caller's parsed JSON, so a
+     * later edit (which mutates a shape's bezier in place) can't reach back into it. A missing
+     * labelVert is left null — the viewer back-fills it from geometry (see draw-pipeline's
+     * backfillLabel), so reloaded ROIs label the same way freshly drawn ones do. */
     loadJSON(doc) {
       if (!doc || !doc.format || !String(doc.format).startsWith("pycortex-roidraw"))
         throw new Error("unrecognized format: " + (doc && doc.format));
@@ -1227,14 +1286,28 @@ ${paths.join("\n")}
           color: r.color,
           left: (v.left || []).slice(),
           right: (v.right || []).slice(),
-          outline: r.outline ? r.outline.slice() : null,
-          labelVert: r.labelVert || null,
-          bezier: r.bezier || null
+          outline: copyRing(r.outline),
+          labelVert: copyVert(r.labelVert),
+          bezier: copyBezier(r.bezier)
         }));
       }
       return added;
     }
   };
+  var copyVert = (o) => o ? { h: o.h, g: o.g } : null;
+  var copyRing = (ring) => Array.isArray(ring) ? ring.map(copyVert) : null;
+  var copyPts = (pts) => Array.isArray(pts) ? pts.map((p) => [p[0], p[1]]) : [];
+  function copyBezier(bez) {
+    if (!bez || !Array.isArray(bez.anchors)) return null;
+    const out = {
+      anchors: copyPts(bez.anchors),
+      inHandles: copyPts(bez.inHandles),
+      outHandles: copyPts(bez.outHandles)
+    };
+    if (bez.closed !== void 0) out.closed = !!bez.closed;
+    if (Array.isArray(bez.smooth)) out.smooth = bez.smooth.map(Boolean);
+    return out;
+  }
 
   // core/draw-mode.js
   var MODE = { DISPLAY: "display", DRAW: "draw" };
@@ -1400,7 +1473,7 @@ ${paths.join("\n")}
   }
   function fitHomography(src, dst) {
     const n = Math.min(src.length, dst.length);
-    if (n < 4 || !spans2D(src)) return null;
+    if (n < 4 || !spans2D(src) || !spans2D(dst)) return null;
     const ATA = Array.from({ length: 8 }, () => new Array(8).fill(0));
     const ATb = new Array(8).fill(0);
     const row = new Array(8);
@@ -1571,6 +1644,16 @@ ${paths.join("\n")}
   var DRAG_THRESHOLD = 4;
   var LASSO_STROKE = "#ffcc00";
   var LASSO_WIDTH = 1.5;
+  function bboxDiagonal(pts) {
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const p of pts) {
+      if (p[0] < minX) minX = p[0];
+      if (p[0] > maxX) maxX = p[0];
+      if (p[1] < minY) minY = p[1];
+      if (p[1] > maxY) maxY = p[1];
+    }
+    return Math.hypot(maxX - minX, maxY - minY);
+  }
   var LassoOverlay = class {
     constructor(adapter, { onLasso, onInspect, onTrace } = {}) {
       this.adapter = adapter;
@@ -1614,8 +1697,10 @@ ${paths.join("\n")}
       this.el.style.top = Math.round(r.top) + "px";
       this.el.style.width = w + "px";
       this.el.style.height = h + "px";
-      this.el.width = w;
-      this.el.height = h;
+      if (this.el.width !== w || this.el.height !== h) {
+        this.el.width = w;
+        this.el.height = h;
+      }
       this._redraw();
     }
     setActive(on) {
@@ -1699,20 +1784,10 @@ ${paths.join("\n")}
       const pts = this.lasso;
       this.lasso = [];
       this._redraw();
-      if (this.tool === "trace") {
-        if (pts.length >= 2) {
-          let minX = pts[0][0], maxX = pts[0][0], minY = pts[0][1], maxY = pts[0][1];
-          for (let j = 1; j < pts.length; j++) {
-            minX = Math.min(minX, pts[j][0]);
-            maxX = Math.max(maxX, pts[j][0]);
-            minY = Math.min(minY, pts[j][1]);
-            maxY = Math.max(maxY, pts[j][1]);
-          }
-          if (Math.hypot(maxX - minX, maxY - minY) > DRAG_THRESHOLD) this.onTrace(pts);
-        }
-        return;
-      }
-      if (pts.length >= 3) this.onLasso(pts);
+      const minPts = this.tool === "trace" ? 2 : 3;
+      if (pts.length < minPts || bboxDiagonal(pts) <= DRAG_THRESHOLD) return;
+      if (this.tool === "trace") this.onTrace(pts);
+      else this.onLasso(pts);
     }
     _onWheel(e) {
       if (!this.active) return;
@@ -1801,7 +1876,7 @@ ${paths.join("\n")}
       this.adapter = adapter;
       this.onEdit = onEdit || (() => {
       });
-      this.roi = null;
+      this.shape = null;
       this.bez = null;
       this._uvPoly = null;
       this.H = null;
@@ -1847,19 +1922,20 @@ ${paths.join("\n")}
         this.el.height = h;
       }
     }
-    // Begin editing `roi` (must have a bezier), or pass null to stop.
-    setEditing(roi) {
-      this.roi = roi && roi.bezier && roi.bezier.anchors ? roi : null;
-      this.bez = this.roi ? cloneBezier(this.roi.bezier) : null;
+    // Begin editing `shape` — an ROI (closed curve) or a sulcus (open one); it must carry a bezier.
+    // Pass null to stop.
+    setEditing(shape) {
+      this.shape = shape && shape.bezier && shape.bezier.anchors ? shape : null;
+      this.bez = this.shape ? cloneBezier(this.shape.bezier) : null;
       this._sel = -1;
       this._recurve();
       this._drag = null;
       this._dragMoved = false;
       this._hover = null;
       this._panLast = null;
-      this.el.style.pointerEvents = this.roi ? "auto" : "none";
-      this.el.classList.toggle("roidraw-edit-overlay--active", !!this.roi);
-      if (this.roi) {
+      this.el.style.pointerEvents = this.shape ? "auto" : "none";
+      this.el.classList.toggle("roidraw-edit-overlay--active", !!this.shape);
+      if (this.shape) {
         this.syncRect();
         this.reproject();
       } else {
@@ -1868,7 +1944,7 @@ ${paths.join("\n")}
       }
     }
     isEditing() {
-      return !!this.roi;
+      return !!this.shape;
     }
     // Re-sample the bezier to a uv polyline. Only the curve changes (on an edit), never the view —
     // so caching this lets the per-frame tracking loop just re-map it through the new homography
@@ -1886,7 +1962,7 @@ ${paths.join("\n")}
     }
     _trackFrame() {
       this._raf = 0;
-      if (!this.roi) return;
+      if (!this.shape) return;
       this.reproject();
       if (now() < this._trackUntil) this._raf = requestAnimationFrame(() => this._trackFrame());
     }
@@ -1898,8 +1974,8 @@ ${paths.join("\n")}
       this._trackUntil = 0;
     }
     // Re-fit the uv->px homography for the current view and redraw. Call on pan/zoom/mix/resize.
-    // The fit is LOCAL to the ROI: the flatmap isn't perfectly planar, so one global homography
-    // drifts (the curve sits slightly inside the baked outline), but around a single ROI it's
+    // The fit is LOCAL to the shape: the flatmap isn't perfectly planar, so one global homography
+    // drifts (the curve sits slightly inside the baked outline), but around a single shape it's
     // near-exact. Falls back to the whole flatmap only if the local region is too sparse on screen.
     reproject() {
       if (!this.bez || this.bez.anchors.length < minAnchors(this.bez)) {
@@ -1965,7 +2041,7 @@ ${paths.join("\n")}
       return dx * dx + dy * dy <= CURVE_HIT * CURVE_HIT ? { seg: hit.seg, t: hit.t } : null;
     }
     _onDown(e) {
-      if (!this.roi || !this.Hinv) return;
+      if (!this.shape || !this.Hinv) return;
       e.preventDefault();
       const pt = this._evtPt(e);
       const hit = e.shiftKey ? null : this._hitTest(pt);
@@ -2032,7 +2108,7 @@ ${paths.join("\n")}
       }
     }
     _onDblClick(e) {
-      if (!this.roi || !this.Hinv) return;
+      if (!this.shape || !this.Hinv) return;
       e.preventDefault();
       const pt = this._evtPt(e);
       const anchor = this._hitTestAnchorOnly(pt);
@@ -2068,7 +2144,7 @@ ${paths.join("\n")}
       this.el.style.cursor = "default";
     }
     _onKeyDown(e) {
-      if (!this.roi || this._sel < 0) return;
+      if (!this.shape || this._sel < 0) return;
       if (e.key !== "Delete" && e.key !== "Backspace") return;
       const t = e.target, tag = t && t.tagName;
       if (t && (t.isContentEditable || tag === "TEXTAREA" || tag === "INPUT")) return;
@@ -2083,7 +2159,7 @@ ${paths.join("\n")}
       this.reproject();
     }
     _onWheel(e) {
-      if (!this.roi) return;
+      if (!this.shape) return;
       e.preventDefault();
       this.adapter.zoom(e.deltaY);
       this._pokeTracking();
@@ -2102,7 +2178,7 @@ ${paths.join("\n")}
       const ctx = this.ctx;
       if (!ctx) return;
       this._clear();
-      if (!this.roi || !this.H || !this._uvPoly) return;
+      if (!this.shape || !this.H || !this._uvPoly) return;
       const toPx = (uv) => applyHomography(this.H, uv);
       const poly = this._uvPoly.map(toPx);
       ctx.strokeStyle = COLOR.curve;
@@ -2164,13 +2240,30 @@ ${paths.join("\n")}
   };
 
   // ui/draw-panel.js
+  function button(label, on, className) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = label;
+    if (className) b.className = className;
+    b.onclick = () => on();
+    return b;
+  }
   var DrawPanel = class {
+    // Every callback is normalized to a no-op once, here, so no call site has to guard.
     constructor({ onExport, onExportSulci, onImport, onClear, onRemove, onEdit, onTool } = {}) {
       this.onRemove = onRemove || (() => {
       });
       this.onEdit = onEdit || (() => {
       });
       this.onTool = onTool || (() => {
+      });
+      const exportRois = onExport || (() => {
+      });
+      const exportSulci = onExportSulci || (() => {
+      });
+      const importFile = onImport || (() => {
+      });
+      const clearAll = onClear || (() => {
       });
       this._editingId = null;
       const el = document.createElement("div");
@@ -2185,12 +2278,8 @@ ${paths.join("\n")}
       tools.setAttribute("aria-label", "shape kind");
       this._toolBtns = {};
       for (const [tool, label] of [["lasso", "ROI"], ["trace", "Sulcus"]]) {
-        const b = document.createElement("button");
-        b.type = "button";
-        b.className = "roidraw-tools__btn";
-        b.textContent = label;
+        const b = button(label, () => this.setTool(tool), "roidraw-tools__btn");
         b.setAttribute("aria-pressed", String(tool === this.tool));
-        b.onclick = () => this.setTool(tool);
         this._toolBtns[tool] = b;
         tools.appendChild(b);
       }
@@ -2198,26 +2287,14 @@ ${paths.join("\n")}
       this.statusEl = document.createElement("div");
       this.statusEl.className = "roidraw-status";
       el.appendChild(this.statusEl);
-      this.doneEl = document.createElement("button");
-      this.doneEl.type = "button";
-      this.doneEl.className = "roidraw-done";
-      this.doneEl.textContent = "\u2713 Done editing";
+      this.doneEl = button("\u2713 Done editing", () => this.onEdit(null), "roidraw-done");
       this.doneEl.style.display = "none";
-      this.doneEl.onclick = () => this.onEdit(null);
       el.appendChild(this.doneEl);
       this.listEl = document.createElement("div");
       this.listEl.className = "roidraw-list";
       el.appendChild(this.listEl);
-      const exp = document.createElement("button");
-      exp.type = "button";
-      exp.textContent = "Export ROIs (JSON)";
-      exp.onclick = () => onExport && onExport();
-      el.appendChild(exp);
-      const expS = document.createElement("button");
-      expS.type = "button";
-      expS.textContent = "Export sulci (SVG)";
-      expS.onclick = () => onExportSulci && onExportSulci();
-      el.appendChild(expS);
+      el.appendChild(button("Export ROIs (JSON)", exportRois));
+      el.appendChild(button("Export sulci (SVG)", exportSulci));
       const lab = document.createElement("label");
       lab.textContent = "Import: ";
       const inp = document.createElement("input");
@@ -2225,17 +2302,13 @@ ${paths.join("\n")}
       inp.accept = "application/json";
       inp.onchange = (e) => {
         const f = e.target.files && e.target.files[0];
-        if (f && onImport) onImport(f);
+        if (f) importFile(f);
         e.target.value = "";
         e.target.blur();
       };
       lab.appendChild(inp);
       el.appendChild(lab);
-      const clr = document.createElement("button");
-      clr.type = "button";
-      clr.textContent = "Clear all";
-      clr.onclick = () => onClear && onClear();
-      el.appendChild(clr);
+      el.appendChild(button("Clear all", clearAll));
       this.msgEl = document.createElement("div");
       this.msgEl.className = "roidraw-msg";
       el.appendChild(this.msgEl);
@@ -2313,27 +2386,17 @@ ${paths.join("\n")}
         ct.textContent = sulcus ? String(s.bezier && s.bezier.anchors ? s.bezier.anchors.length : 0) : String(s.left.length + s.right.length);
         ct.title = sulcus ? "anchors" : "vertices";
         row.appendChild(ct);
-        const edit = document.createElement("button");
-        edit.type = "button";
-        edit.className = "roidraw-roi__editbtn" + (editing ? " roidraw-roi__editbtn--on" : "");
-        edit.textContent = editing ? "editing" : "\u270E edit";
+        const edit = button(
+          editing ? "editing" : "\u270E edit",
+          () => this.onEdit(editing ? null : s.id),
+          "roidraw-roi__editbtn" + (editing ? " roidraw-roi__editbtn--on" : "")
+        );
         edit.title = s.bezier ? editing ? "finish editing" : "edit shape" : "no editable curve";
         edit.disabled = !s.bezier;
-        edit.onclick = (e) => {
-          e.preventDefault();
-          if (s.bezier) this.onEdit(editing ? null : s.id);
-        };
         row.appendChild(edit);
-        const del = document.createElement("button");
-        del.type = "button";
-        del.className = "roidraw-roi__del";
-        del.textContent = "\u2715";
+        const del = button("\u2715", () => this.onRemove(s.id), "roidraw-roi__del");
         del.title = "remove";
         del.setAttribute("aria-label", "remove " + (sulcus ? "sulcus " : "ROI ") + s.name);
-        del.onclick = (e) => {
-          e.preventDefault();
-          this.onRemove(s.id);
-        };
         row.appendChild(del);
         list.appendChild(row);
       }
@@ -2385,6 +2448,18 @@ ${paths.join("\n")}
   var LAYER = "drawnrois";
   var FILL_TARGET = 0.7;
   var FRAME_LERP = 0.3;
+  var FRAME_TRIES = 60;
+  var FRAME_POLL_MS = 100;
+  var DOWNLOAD_TEARDOWN_MS = 4e3;
+  var OVERLAY_SYNC_TRIES = 40;
+  var OVERLAY_SYNC_MS = 250;
+  var STATUS = {
+    flattening: "Flattening\u2026",
+    editing: "Editing \u2014 drag \u25CF to move \xB7 click an anchor, drag \u25CB to bend \xB7 double-click the line to add a point \xB7 double-click \u25CF to toggle corner/smooth \xB7 select + Delete to remove \xB7 scroll to zoom \xB7 \u2713 done when finished.",
+    trace: "Drag along the sulcus \xB7 \u270E to edit a curve \xB7 scroll to zoom \xB7 Shift+drag to pan \xB7 Shift+click to inspect.",
+    lasso: "Lasso to draw an ROI \xB7 \u270E to edit a shape \xB7 scroll to zoom \xB7 Shift+drag to pan \xB7 Shift+click to inspect."
+  };
+  var byteLength = (s) => new TextEncoder().encode(s).length;
   function injectCss() {
     if (document.getElementById("roidraw-css")) return;
     const s = document.createElement("style");
@@ -2407,6 +2482,9 @@ ${paths.join("\n")}
         onEdit: (bez) => this._applyEdit(bez)
       });
       this.editingId = null;
+      this._timers = /* @__PURE__ */ new Set();
+      this._syncRetries = 0;
+      this._syncTimer = 0;
       this.panel = new DrawPanel({
         onExport: () => this.exportJSON(),
         onExportSulci: () => this.exportSulciSVG(),
@@ -2430,6 +2508,16 @@ ${paths.join("\n")}
     get mode() {
       return this._dm.mode;
     }
+    /* setTimeout, remembered, so destroy() can cancel it. autoAttach destroys a prior drawer
+     * before attaching a new one; an orphaned poll would keep calling a dead adapter. */
+    _later(fn, ms) {
+      const id = setTimeout(() => {
+        this._timers.delete(id);
+        fn();
+      }, ms);
+      this._timers.add(id);
+      return id;
+    }
     // --- view framing -----------------------------------------------------------------
     _frame() {
       const fr = this.adapter.measureFrame(FILL_TARGET);
@@ -2441,7 +2529,7 @@ ${paths.join("\n")}
     _frameOnLoad(tries) {
       const fr = this.adapter.measureFrame(FILL_TARGET);
       if (!fr) {
-        if (tries < 60) setTimeout(() => this._frameOnLoad(tries + 1), 100);
+        if (tries < FRAME_TRIES) this._later(() => this._frameOnLoad(tries + 1), FRAME_POLL_MS);
         return;
       }
       this.adapter.animateCamera({ target: fr.com, radius: fr.radius });
@@ -2458,6 +2546,7 @@ ${paths.join("\n")}
     }
     // --- modes ------------------------------------------------------------------------
     setMode(mode) {
+      if (mode === "draw" && this.mode === "draw") return;
       if (mode === "draw") {
         if (this._dm.enterDraw().flatten) this.adapter.flatten();
         this.adapter.setControlPanelVisible(false);
@@ -2488,12 +2577,11 @@ ${paths.join("\n")}
     _renderStatus() {
       if (this.mode !== "draw") return;
       if (!this.adapter.isFlat()) {
-        this.panel.setStatus("Flattening\u2026", "warn");
+        this.panel.setStatus(STATUS.flattening, "warn");
         return;
       }
-      if (this.editOverlay.isEditing()) this.panel.setStatus("Editing \u2014 drag \u25CF to move \xB7 click an anchor, drag \u25CB to bend \xB7 double-click the line to add a point \xB7 double-click \u25CF to toggle corner/smooth \xB7 select + Delete to remove \xB7 scroll to zoom \xB7 \u2713 done when finished.", "draw");
-      else if (this.overlay.tool === "trace") this.panel.setStatus("Drag along the sulcus \xB7 \u270E to edit a curve \xB7 scroll to zoom \xB7 Shift+drag to pan \xB7 Shift+click to inspect.", "draw");
-      else this.panel.setStatus("Lasso to draw an ROI \xB7 \u270E to edit a shape \xB7 scroll to zoom \xB7 Shift+drag to pan \xB7 Shift+click to inspect.", "draw");
+      if (this.editOverlay.isEditing()) this.panel.setStatus(STATUS.editing, "draw");
+      else this.panel.setStatus(this.overlay.tool === "trace" ? STATUS.trace : STATUS.lasso, "draw");
     }
     // --- drawing pipeline -------------------------------------------------------------
     _finishLasso(pts) {
@@ -2533,12 +2621,13 @@ ${paths.join("\n")}
       this.panel.message('Sulcus "' + name + '": ' + curve.bezier.anchors.length + " anchors. \u270E editable.");
     }
     // --- editing ----------------------------------------------------------------------
-    // Toggle shape editing. id => start editing that ROI's bezier; null => stop.
+    // Toggle shape editing. id => start editing that shape's bezier; null => stop.
     _editToggle(id) {
-      const roi = id != null ? this.shapes.shapes.find((r) => r.id === id) : null;
-      if (roi && this._dm.noteEditStart(this.adapter.isFlat()).flatten) this.adapter.flatten();
-      this.editingId = roi ? roi.id : null;
-      this.editOverlay.setEditing(roi || null);
+      const found = id != null ? this.shapes.shapes.find((s) => s.id === id) : null;
+      const shape = found && found.bezier && found.bezier.anchors ? found : null;
+      if (shape && this._dm.noteEditStart(this.adapter.isFlat()).flatten) this.adapter.flatten();
+      this.editingId = shape ? shape.id : null;
+      this.editOverlay.setEditing(shape);
       this.panel.setEditingId(this.editingId);
       this._updateDrawActive();
       this.panel.renderList(this.shapes.shapes);
@@ -2562,12 +2651,27 @@ ${paths.join("\n")}
         const lv = labelForCurve(this.adapter, bezier);
         if (lv) shape.labelVert = lv;
       }
-      this.adapter.setOverlayLayer(LAYER, this.shapes.shapes);
-      this.panel.renderList(this.shapes.shapes);
+      this._sync();
     }
+    // Push the model into the surface overlay and the panel. setOverlayLayer fails while the host's
+    // SVG overlay is still loading; without a retry the shape sits in the model and the panel,
+    // listed and counted, and is simply never drawn. Poll until it lands.
     _sync() {
-      this.adapter.setOverlayLayer(LAYER, this.shapes.shapes);
       this.panel.renderList(this.shapes.shapes);
+      if (this.adapter.setOverlayLayer(LAYER, this.shapes.shapes)) {
+        this._syncRetries = 0;
+        return;
+      }
+      if (this._syncTimer) return;
+      if (this._syncRetries >= OVERLAY_SYNC_TRIES) {
+        this.panel.message("The viewer's SVG overlay never loaded \u2014 shapes can't be drawn onto the surface.");
+        return;
+      }
+      if (this._syncRetries++ === 0) this.panel.message("Waiting for the viewer's SVG overlay to load\u2026");
+      this._syncTimer = this._later(() => {
+        this._syncTimer = 0;
+        this._sync();
+      }, OVERLAY_SYNC_MS);
     }
     remove(id) {
       if (id === this.editingId) this._editToggle(null);
@@ -2589,10 +2693,10 @@ ${paths.join("\n")}
       a.style.display = "none";
       document.body.appendChild(a);
       a.click();
-      setTimeout(() => {
+      this._later(() => {
         a.remove();
         URL.revokeObjectURL(url);
-      }, 4e3);
+      }, DOWNLOAD_TEARDOWN_MS);
     }
     exportJSON() {
       const rois = this.shapes.byKind("roi");
@@ -2608,10 +2712,10 @@ ${paths.join("\n")}
         return;
       }
       this._download(text, "rois.json", "application/json");
-      this.panel.message("Exported " + rois.length + " ROI(s), " + text.length + " bytes, to rois.json.");
+      this.panel.message("Exported " + rois.length + " ROI(s), " + byteLength(text) + " bytes, to rois.json.");
     }
-    /* Sulci export as pycortex's OWN overlays.svg markup, not as a roidraw JSON format: paste or
-     * merge the fragment into the subject's overlays.svg and quickflat/WebGL/Inkscape read it. */
+    /* Sulci export as pycortex's OWN overlays.svg markup, not as a roidraw JSON format: copy the
+     * shape groups into the subject's overlays.svg and quickflat/WebGL/Inkscape read them. */
     exportSulciSVG() {
       const sulci = this.shapes.byKind("sulcus");
       if (!sulci.length) {
@@ -2625,12 +2729,16 @@ ${paths.join("\n")}
         this.panel.message("Export failed: " + (e && e.message ? e.message : e));
         return;
       }
+      if (xml === null) {
+        this.panel.message("Export failed: the viewer's SVG overlay isn't loaded yet \u2014 try again in a moment.");
+        return;
+      }
       if (!xml) {
-        this.panel.message("Export failed: the SVG overlay isn't loaded yet.");
+        this.panel.message("Export failed: no sulcus has a usable curve (each needs at least 2 anchors).");
         return;
       }
       this._download(xml, "sulci.svg", "image/svg+xml");
-      this.panel.message("Exported " + sulci.length + " sulcus curve(s), " + xml.length + " bytes, to sulci.svg.");
+      this.panel.message("Exported " + sulci.length + " sulcus curve(s), " + byteLength(xml) + " bytes, to sulci.svg.");
     }
     _import(file) {
       const reader = new FileReader();
@@ -2684,15 +2792,20 @@ ${paths.join("\n")}
       window.addEventListener("keyup", this._keyup, true);
       window.addEventListener("blur", this._blur);
     }
-    // Tear down everything attach() wired up: the mix subscription, the window listeners, and every
-    // child UI component (each has its own destroy()). Lets a viewer detach/re-attach without leaking.
+    // Tear down everything attach() wired up: pending timers, the mix subscription, the window
+    // listeners, the adapter's own host hooks, and every child UI component (each has its own
+    // destroy()). Lets a viewer detach/re-attach without leaking — which autoAttach does on reload.
     destroy() {
+      for (const id of this._timers) clearTimeout(id);
+      this._timers.clear();
+      this._syncTimer = 0;
       if (this._unsubMix) this._unsubMix();
       window.removeEventListener("resize", this._onResize);
       window.removeEventListener("keydown", this._keydown, true);
       window.removeEventListener("keyup", this._keyup, true);
       window.removeEventListener("blur", this._blur);
       for (const c of [this.overlay, this.editOverlay, this.panel, this.toggle]) if (c && c.destroy) c.destroy();
+      if (this.adapter && this.adapter.destroy) this.adapter.destroy();
     }
     // True only for text-entry targets (so we don't swallow Shift/Esc there). A file/button input
     // is NOT text entry, so global gestures keep working even if such an element holds focus.
